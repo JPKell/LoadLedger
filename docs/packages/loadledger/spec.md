@@ -46,7 +46,7 @@ a piece of content cost to produce") — accumulates the same entries per unit a
 | Responsibility | Detail |
 |---|---|
 | Accumulation | Sum `TokenUsage` exactly; sum `Money` exactly per currency; never sum across currencies |
-| Unsupported honesty | A debit with an unsupported cost accumulates tokens, flags `unpriced=True`, and money balances are unaffected — never zeroed ([ADR-0016](../../adr/0016-unavailable-is-not-zero.md)) |
+| Unsupported honesty | A debit with no estimate accumulates tokens, flags `unpriced=True`, and touches no money balance — never zeroed ([ADR-0016](../../adr/0016-unavailable-is-not-zero.md)). A debit whose estimate did not total adds the components that were priced and nothing for the rest, so the money balance is a floor and the verdict's counts say so ([ADR-0069](../../adr/0069-a-partial-price-is-a-floor-and-a-money-ceiling-chooses-how-it-binds.md)) |
 | Ceilings | Evaluate every active ceiling on `debit` and `would_exceed`; report each verdict with numbers |
 | Record | Every entry stores `TokenUsage` + `pricing_hash`, per ADR-0030 rule 1 — history is re-costable |
 | History | `entries()` filtered by scope, tag, time window — the input to PromptCadence's historical estimator and IdeaPress's per-unit cost view |
@@ -65,7 +65,8 @@ PromptCadence (trajectory budgets), IdeaPress (per-unit and per-project cost, ad
 ## 7. Public API
 
 ```python
-class CeilingScope(Enum): PER_RUN = "per_run"; PER_DAY = "per_day"; PER_TAG = "per_tag"
+class CeilingScope(StrEnum): PER_RUN = "per_run"; PER_DAY = "per_day"; PER_TAG = "per_tag"
+class PartialPricing(StrEnum): FLOOR = "floor"; STRICT = "strict"     # ADR-0069
 
 @dataclass(frozen=True, slots=True)
 class BudgetCeiling:
@@ -73,6 +74,10 @@ class BudgetCeiling:
     money: Money | None = None         # binds priced usage in this currency
     tokens: int | None = None          # binds all usage
     tag: str | None = None             # required for PER_TAG (PromptCadence: the tier name)
+    partial_pricing: PartialPricing = PartialPricing.FLOOR
+                                       # keyword-only. FLOOR: bind on what was priced, may fire
+                                       # late. STRICT: an estimate in scope that did not total
+                                       # counts as exceeding; requires a money bound
     # at least one of money/tokens required; both permitted
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +92,16 @@ class Debit:
 @dataclass(frozen=True, slots=True)
 class CeilingVerdict:
     ceiling: BudgetCeiling
-    exceeded: bool
-    money_spent: Money | None          # None when nothing priced yet in this scope
+    exceeded: bool                     # strictly greater than a bound; under STRICT, also true when
+                                       # untotalled_debit_count > 0
+    money_spent: Money | None          # None when nothing priced yet in this scope; a floor when
+                                       # unpriced_debit_count > 0 — render as "at least"
     money_remaining: Money | None
-    tokens_spent: int
+    tokens_spent: int                  # the classes providers reported; a floor when unmetered > 0
     tokens_remaining: int | None
+    unpriced_debit_count: int = 0      # no estimate, or an estimate that did not total
+    untotalled_debit_count: int = 0    # the subset that carried an estimate which did not total
+    unmetered_debit_count: int = 0     # left at least one token class unreported
 
 @dataclass(frozen=True, slots=True)
 class LedgerEntry:
@@ -122,7 +132,7 @@ def mount_ledger_tables(metadata: MetaData, *, prefix: str = "ledger_") -> Ledge
 # Errors (subclass baseaicore.SuiteError)
 LedgerError                LEDGER_ERROR
 ├── CurrencyMismatch       LEDGER_CURRENCY_MISMATCH   # ceiling USD, debit EUR — refused, not converted
-├── InvalidCeiling         LEDGER_CEILING_INVALID
+├── InvalidCeiling         LEDGER_CEILING_INVALID     # incl. STRICT partial pricing with no money bound
 └── UnknownRun             LEDGER_UNKNOWN_RUN
 ```
 
@@ -146,9 +156,16 @@ the rows and the retention (PromptCadence's `ledger_entries`, IdeaPress's when i
 1. **Store usage; derive cost** (ADR-0030 rule 1): an entry's primary facts are `TokenUsage` and
    `pricing_hash`; monetary balances are recomputable from entries and a price catalogue, and a
    test proves re-costing history changes no stored row.
-2. **Unpriced is never zero**: an unpriced debit leaves every money balance untouched and sets
-   `unpriced=True`; the money verdict for a scope containing unpriced remote usage carries the
-   unpriced count, so "under budget" is never claimed over an incomplete sum without saying so.
+2. **Unpriced is never zero, and a partial price is a floor**
+   ([ADR-0069](../../adr/0069-a-partial-price-is-a-floor-and-a-money-ceiling-chooses-how-it-binds.md)):
+   a debit with no estimate leaves every money balance untouched; a debit whose estimate did not
+   total adds the components that were priced and nothing for the rest. Both set `unpriced=True`
+   on the entry. Every money verdict carries `unpriced_debit_count` (so `money_spent` is a floor
+   whenever it is non-zero, rendered as "at least"), `untotalled_debit_count` (the estimates that
+   did not total) and `unmetered_debit_count`. On a floor, `exceeded` is certain when true and not
+   when false; a `STRICT` money ceiling treats `untotalled_debit_count > 0` as exceeded instead, so
+   its cap is never crossed. "Under budget" is never claimed over an incomplete sum without saying
+   so.
 3. **Exact arithmetic**: token and nano sums are integer-exact; a mixed-currency debit against a
    ceiling raises `CurrencyMismatch` rather than converting (ADR-0030 rule 3).
 4. **Deterministic verdicts**: same ceilings + same entries ⇒ same verdicts, byte-identical in
@@ -172,6 +189,7 @@ Constructor arguments only.
 |---|---|
 | Ceiling with neither money nor tokens | `InvalidCeiling` at construction |
 | `PER_TAG` ceiling without a tag | `InvalidCeiling` |
+| `STRICT` partial pricing on a ceiling with no money bound | `InvalidCeiling` — strictness is a statement about the money bound |
 | Debit currency ≠ ceiling currency | `CurrencyMismatch`, both named |
 | `remaining`/`would_exceed` for an unknown run | `UnknownRun` (a run exists once debited or declared) |
 | Debit exceeding a ceiling | **Not an error.** The entry records `exceeded=True` verdicts; refusing work is the caller's policy. `would_exceed` exists so the caller can refuse *before* spending |
@@ -204,7 +222,7 @@ No logging. `LedgerEntry` is exactly the body of the suite's `budget.debited` ev
 | Area | Tests |
 |---|---|
 | Arithmetic | Integer exactness at large sums; per-currency separation; token/money independence |
-| Unsupported | Unpriced debits: tokens accumulate, money untouched, counts surfaced; a partial sum never claims completeness |
+| Unsupported | Debits with no estimate: tokens accumulate, money untouched. Estimates that did not total: the priced components accumulate as a floor, all three counts surfaced; a partial sum never claims completeness. `STRICT` fires on an untotalled estimate, at pre-flight too, and not on a debit with no estimate |
 | Ceilings | Each scope; multiple active; most-restrictive binding; UTC day boundary; per-tag isolation |
 | Re-costing | Entries re-costed under a corrected price list reproduce totals without any row changing |
 | Atomicity | Kill mid-debit (SQLite + PostgreSQL): entry and verdicts both present or both absent |
@@ -226,7 +244,7 @@ migration, so the recipe is documentation plus a helper, never an auto-migration
    verdicts, and the pre-flight `would_exceed` refuses the step that would cross.
 2. A standalone script with `loadledger[sql]` + `baseaicore` mounts the tables into its own
    SQLite database, debits priced and unpriced usage, and prints honest balances (`—`, not `$0`,
-   for the unpriced local model).
+   for the unpriced local model; "at least" for a floor).
 3. Re-costing test (contract 1) passes.
 4. `mypy --strict`, `ruff`, `lint-imports` clean; coverage ≥ 95 %.
 

@@ -33,7 +33,10 @@ tests/unit/{test_types,test_verdicts,test_memory_ledger,test_windows}.py
 
 **Tests**
 * Integer exactness at large sums; per-currency separation; `CurrencyMismatch` on a mixed debit.
-* Unpriced debits: tokens accumulate, money untouched, unpriced count surfaced on money verdicts.
+* Unpriced debits: tokens accumulate; a debit with no estimate leaves money untouched; an estimate
+  that did not total accumulates its priced components as a floor; all three counts surfaced on
+  money verdicts; a `STRICT` ceiling fires on an untotalled estimate and not on a local debit
+  (ADR-0069).
 * Every scope; several ceilings active at once; most-restrictive binding; the UTC midnight
   boundary with an injected clock.
 * `would_exceed` side-effect-free (state hash before/after).
