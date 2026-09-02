@@ -65,8 +65,9 @@ application's point of view.
 
 **Work**
 * `sql.py`: `mount_ledger_tables(metadata, prefix)` — plain-typed columns, no weightsdb import,
-  no engine, no session, no Alembic history of its own; `SqlLedger` over a caller session
-  factory; debit + verdicts in one transaction (spec contract 5).
+  no engine, no session, no Alembic history of its own; a run record beside the entries, so a run
+  declared with nothing debited survives a restart (`declare_run`, spec §7/§13); `SqlLedger` over
+  a caller session factory; debit + verdicts in one transaction (spec contract 5).
 * The `[sql]` extra; an upgrade-note template for host applications (the host owns migrations).
 * README, quickstart (standalone mount into a script's own SQLite file); publish
   `loadledger 0.1.0`.

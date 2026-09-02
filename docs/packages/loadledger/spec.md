@@ -23,7 +23,8 @@ a piece of content cost to produce") — accumulates the same entries per unit a
   `per-tag`).
 * `LedgerEntry`: one debit — `TokenUsage`, the `CostEstimate` (or its unsupported reasons), the
   source reference, and the running balances after, per active ceiling.
-* The `Ledger` protocol: `debit()`, `remaining()`, `would_exceed()`, `entries()`.
+* The `Ledger` protocol: `debit()`, `remaining()`, `would_exceed()`, `entries()`,
+  `declare_run()`.
 * `InMemoryLedger` (the deterministic test double, first-class) and `SqlLedger` over the mountable
   models in `loadledger.sql`.
 * Ceiling evaluation: multiple active ceilings, most restrictive binds, every verdict explicable.
@@ -119,6 +120,9 @@ class Ledger(Protocol):
     def remaining(self, run_id: str) -> tuple[CeilingVerdict, ...]: ...
     def entries(self, *, run_id: str | None = None, tag: str | None = None,
                 since: datetime | None = None) -> Sequence[LedgerEntry]: ...
+    def declare_run(self, run_id: str) -> None: ...
+        # a run exists once debited or declared (§13); idempotent; a blank id is refused.
+        # PromptCadence declares at trajectory creation, so pre-flight never meets UnknownRun
 
 InMemoryLedger(ceilings: Sequence[BudgetCeiling], *, clock: Clock)
 SqlLedger(session_factory, ceilings: Sequence[BudgetCeiling], *, clock: Clock,
