@@ -68,6 +68,11 @@ application's point of view.
   no engine, no session, no Alembic history of its own; a run record beside the entries, so a run
   declared with nothing debited survives a restart (`declare_run`, spec §7/§13); `SqlLedger` over
   a caller session factory; debit + verdicts in one transaction (spec contract 5).
+* `SqlLedger` is stateless and cheap to construct: balances persist per window (scope, window
+  key) whatever ceilings exist, so an application resolves its ceiling set per operation — the
+  configured defaults, this run's own budget, this project's cap — and builds a ledger view with
+  it. A ceiling added later binds on the full history. The window key is a string, so composite
+  scopes (spec §21) need no schema change.
 * The `[sql]` extra; an upgrade-note template for host applications (the host owns migrations).
 * README, quickstart (standalone mount into a script's own SQLite file); publish
   `loadledger 0.1.0`.

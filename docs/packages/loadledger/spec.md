@@ -20,7 +20,11 @@ a piece of content cost to produce") — accumulates the same entries per unit a
 ## 2. Scope
 
 * `BudgetCeiling`: a cap — money and/or tokens — with a scope (`per-run`, `per-day` UTC,
-  `per-tag`).
+  `per-tag`). A window spans exactly its own dimension: `per-run` is one run; `per-day` is one
+  UTC day across every run in the ledger; `per-tag` is every debit carrying the tag across every
+  run and every day, and never resets. A ledger is the one an application mounts in its own
+  database, so "across every run" means across that application. Finer windows (a tag within a
+  run, a tag within a day) are new scope values when needed, never a reinterpretation of these.
 * `LedgerEntry`: one debit — `TokenUsage`, the `CostEstimate` (or its unsupported reasons), the
   source reference, and the running balances after, per active ceiling.
 * The `Ledger` protocol: `debit()`, `remaining()`, `would_exceed()`, `entries()`,
@@ -255,7 +259,10 @@ migration, so the recipe is documentation plus a helper, never an auto-migration
 ## 21. Future extensions
 
 * IdeaPress adoption: per-unit and per-project scopes are `PER_RUN`/`PER_TAG` as-is; the adoption
-  phase decides its tags.
+  phase decides its tags and sets a per-output and a per-project ceiling from IdeaPress's
+  configuration (roadmap row J1).
+* Composite windows (`PER_RUN` × tag, `PER_DAY` × tag) as additional scope values, if a consumer
+  needs a tag cap that resets; the persisted balance key (scope, window key) already admits them.
 * A price-catalogue helper, only at ADR-0030's own trigger (two consumers independently
   implementing acquisition).
 * Soft ceilings (warn thresholds below the hard cap) when a UI consumer wants them.
