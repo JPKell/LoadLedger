@@ -1,0 +1,268 @@
+"""``InMemoryLedger`` — the process-local ledger, and the deterministic double (spec §7, §10).
+
+First-class, not a stub. It implements the whole :class:`~loadledger.core.Ledger` protocol with
+the same :class:`~loadledger.core.BalanceBook` a SQL-backed ledger will use in Phase 2, so a
+consumer that tests against this one is testing the arithmetic it will run in production. What it
+does not do is survive the process — it owns no storage, and it says so here rather than letting
+a caller discover it after a restart (spec §10: LoadLedger owns no data).
+
+Determinism is the reason it exists. Given the same clock, the same ceilings and the same debits,
+it produces the same verdicts in the same order, byte-identical when serialized (spec contract 4).
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import TYPE_CHECKING
+
+from baseaicore import UlidGenerator, is_supported
+
+from loadledger.core import BalanceBook
+from loadledger.errors import UnknownRun
+from loadledger.types import LedgerEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+
+    from baseaicore import Clock, CostEstimate, TokenUsage
+
+    from loadledger.types import BudgetCeiling, CeilingVerdict, Debit
+
+__all__ = ["InMemoryLedger"]
+
+
+class InMemoryLedger:
+    """A ledger held in this process's memory, for the life of this process.
+
+    Thread-safe: every public method takes one lock, so a debit and the verdicts it reports are
+    computed against one consistent state and commit together (spec contract 5, the in-memory
+    reading of it).
+
+    Attributes are private; the ledger's surface is the four protocol methods plus
+    :meth:`declare_run`.
+    """
+
+    __slots__ = ("_book", "_clock", "_entries", "_ids", "_lock", "_runs")
+
+    def __init__(self, ceilings: Sequence[BudgetCeiling], *, clock: Clock) -> None:
+        """Build a ledger over a fixed set of ceilings.
+
+        Args:
+            ceilings: The ceilings to evaluate on every debit and every query, already validated
+                by their own constructors. Order is preserved and is the order verdicts come back
+                in. An empty sequence is legitimate: a ledger with no ceilings still accumulates
+                and still answers :meth:`entries`, it simply never refuses.
+            clock: Returns the current timezone-aware instant. Injected and required — a ledger
+                that read the system clock directly could not be tested across a UTC midnight,
+                which is the one boundary this package must get right.
+        """
+        self._book = BalanceBook(ceilings)
+        self._clock: Clock = clock
+        self._entries: list[LedgerEntry] = []
+        self._ids = UlidGenerator(clock=clock)
+        self._lock = threading.Lock()
+        self._runs: set[str] = set()
+
+    def declare_run(self, run_id: str) -> None:
+        """Register a run before anything has been debited against it.
+
+        A run exists once it has been debited *or* declared (spec §13). Declaring one lets a
+        caller ask what a fresh budget allows before spending anything, without
+        :meth:`remaining` having to invent the difference between "this run has spent nothing"
+        and "this run id is a typo".
+
+        Args:
+            run_id: The run identity to register. Declaring an existing run does nothing.
+
+        Raises:
+            ValueError: If ``run_id`` is blank.
+        """
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError(f"run_id must be a non-blank identifier; got {run_id!r}.")
+        with self._lock:
+            self._runs.add(run_id)
+
+    def debit(self, debit: Debit) -> LedgerEntry:
+        """Record one debit and return it with every ceiling's verdict as of that debit.
+
+        The entry and its verdicts are produced together under one lock, so no caller ever sees
+        spend recorded without the verdicts that describe it (spec contract 5).
+
+        ``PER_DAY`` verdicts are resolved against the debit's own ``occurred_at``, not against
+        "now": a debit back-dated into yesterday affects yesterday's window, and the verdict it
+        gets back describes the window it actually landed in.
+
+        **Exceeding a ceiling is not an error.** The entry records ``exceeded=True`` verdicts and
+        the debit stands; refusing work is the caller's policy, and :meth:`would_exceed` exists so
+        it can refuse *before* spending (spec §13).
+
+        Args:
+            debit: The debit to record. ``occurred_at`` is resolved from the injected clock when
+                it is ``None``, and the entry stores the resolved value.
+
+        Returns:
+            The stored :class:`~loadledger.types.LedgerEntry`, carrying the resolved debit, the
+            ``unpriced`` flag, the ``pricing_hash`` and one verdict per configured ceiling.
+
+        Raises:
+            CurrencyMismatch: If the debit is priced in a currency a money ceiling covering it
+                caps in another currency. Refused, never converted (ADR-0030 rule 3).
+        """
+        with self._lock:
+            occurred_at = debit.occurred_at if debit.occurred_at is not None else self._clock()
+            resolved = (
+                debit if debit.occurred_at is not None else _with_occurred_at(debit, occurred_at)
+            )
+            self._book.require_currency_compatible(
+                resolved.cost, run_id=resolved.run_id, at=occurred_at, tags=resolved.tags
+            )
+            self._book.record(resolved, occurred_at=occurred_at)
+            self._runs.add(resolved.run_id)
+            entry = LedgerEntry(
+                entry_id=self._ids.new_id(),
+                debit=resolved,
+                unpriced=_is_unpriced(resolved.cost),
+                pricing_hash=resolved.cost.pricing_hash if resolved.cost is not None else None,
+                verdicts=self._book.verdicts(run_id=resolved.run_id, at=occurred_at),
+            )
+            self._entries.append(entry)
+            return entry
+
+    def would_exceed(
+        self,
+        run_id: str,
+        *,
+        usage: TokenUsage | None = None,
+        cost: CostEstimate | None = None,
+        tags: tuple[str, ...] = (),
+    ) -> tuple[CeilingVerdict, ...]:
+        """Report what every ceiling would say if this spend were recorded now.
+
+        Side-effect-free (spec contract 6): no balance moves, no entry is written, no id is
+        drawn, and the ledger's state hashes identically before and after. Safe to call from an
+        approval path at any frequency.
+
+        Args:
+            run_id: The run the prospective debit would belong to.
+            usage: Its token counts, or ``None`` if not stated.
+            cost: Its cost estimate, or ``None`` if no pricing was applied.
+            tags: Its tags, deciding which ``PER_TAG`` ceilings it would land in.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order, including the prospective
+            spend. With both ``usage`` and ``cost`` ``None`` there is nothing prospective to add
+            and the answer equals :meth:`remaining`.
+
+        Raises:
+            UnknownRun: If this ledger has never seen ``run_id``.
+            CurrencyMismatch: If the prospective cost is in a currency a money ceiling covering it
+                caps in another currency — so a caller learns before spending, not after.
+        """
+        with self._lock:
+            self._require_known(run_id)
+            now = self._clock()
+            self._book.require_currency_compatible(cost, run_id=run_id, at=now, tags=tags)
+            return self._book.verdicts(run_id=run_id, at=now, usage=usage, cost=cost, tags=tags)
+
+    def remaining(self, run_id: str) -> tuple[CeilingVerdict, ...]:
+        """Report every ceiling's current balance for this run.
+
+        ``PER_DAY`` ceilings are reported for the UTC day the injected clock is in — the window a
+        debit made now would land in.
+
+        Args:
+            run_id: The run to report on.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order.
+
+        Raises:
+            UnknownRun: If this ledger has never seen ``run_id``. Answering "nothing spent" for a
+                mistyped run id would be indistinguishable from answering it for a real one.
+        """
+        with self._lock:
+            self._require_known(run_id)
+            return self._book.verdicts(run_id=run_id, at=self._clock())
+
+    def entries(
+        self,
+        *,
+        run_id: str | None = None,
+        tag: str | None = None,
+        since: datetime | None = None,
+    ) -> Sequence[LedgerEntry]:
+        """Return recorded entries, oldest first, narrowed by whichever filters are given.
+
+        This is the input to a caller's own estimator and per-unit cost view (spec §6). It
+        returns entries — usage and pricing hashes — not money, because the money is derived
+        from those and re-derived whenever a price is corrected (ADR-0030 rule 1).
+
+        Args:
+            run_id: Keep only entries for this run.
+            tag: Keep only entries whose debit carries this tag.
+            since: Keep only entries at or after this instant. The window is half-open —
+                ``occurred_at >= since`` — so two consecutive queries with touching bounds return
+                each entry exactly once.
+
+        Returns:
+            A tuple in insertion order, which is the order the ledger recorded them. Filters
+            combine with AND.
+
+        Raises:
+            ValueError: If ``since`` is naive. Comparing a naive bound against stored UTC
+                instants would silently shift the window by the reader's local offset.
+        """
+        if since is not None and (since.tzinfo is None or since.tzinfo.utcoffset(since) is None):
+            raise ValueError(
+                "entries(since=...) requires a timezone-aware instant; got a naive one."
+            )
+        with self._lock:
+            snapshot = tuple(self._entries)
+        return tuple(
+            entry
+            for entry in snapshot
+            if (run_id is None or entry.debit.run_id == run_id)
+            and (tag is None or tag in entry.debit.tags)
+            and (since is None or _at(entry) >= since)
+        )
+
+    def _require_known(self, run_id: str) -> None:
+        """Raise :class:`~loadledger.errors.UnknownRun` unless this run has been seen."""
+        if run_id not in self._runs:
+            raise UnknownRun(
+                f"No run {run_id!r} in this ledger. A run exists once it has been debited or "
+                "declared with declare_run(); reporting an empty balance for an unrecognised id "
+                "would look exactly like reporting one for a run that has spent nothing.",
+                details={"run_id": run_id},
+            )
+
+
+def _with_occurred_at(debit: Debit, occurred_at: datetime) -> Debit:
+    """Return a copy of ``debit`` with its instant resolved.
+
+    ``dataclasses.replace`` is avoided deliberately: it re-runs ``__post_init__``, which is what
+    we want, but it also has to reconstruct a slotted frozen dataclass field by field, and doing
+    it explicitly here keeps the resolved shape visible at the one place it is created.
+    """
+    return type(debit)(
+        run_id=debit.run_id,
+        source_ref=debit.source_ref,
+        usage=debit.usage,
+        cost=debit.cost,
+        tags=debit.tags,
+        occurred_at=occurred_at,
+    )
+
+
+def _is_unpriced(cost: CostEstimate | None) -> bool:
+    """Report whether a cost is absent or could not be totalled (spec §7's ``unpriced``)."""
+    return cost is None or not is_supported(cost.total)
+
+
+def _at(entry: LedgerEntry) -> datetime:
+    """Return an entry's resolved instant; a stored entry always has one."""
+    occurred_at = entry.debit.occurred_at
+    if occurred_at is None:  # pragma: no cover — a recorded entry always has a resolved instant.
+        raise ValueError("A recorded entry must carry a resolved occurred_at.")
+    return occurred_at

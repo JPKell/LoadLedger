@@ -1,0 +1,488 @@
+"""The arithmetic — scope windows, incremental balances, and ceiling evaluation (spec §7, §11).
+
+This module is where a budget is actually kept. It holds no state that outlives a call except the
+balances themselves, performs no I/O, reads no clock of its own, and contains not one float.
+
+Three properties are load-bearing, and each is a named failure mode in the development plan:
+
+* **Windows are resolved, never guessed.** ``PER_DAY`` means a UTC calendar day — half-open from
+  00:00:00Z inclusive to the next 00:00:00Z exclusive. ``PER_RUN`` covers one ``run_id``;
+  ``PER_TAG`` covers every debit carrying one tag, ledger-wide.
+* **Balances are maintained, not recomputed.** :meth:`BalanceBook.record` updates one small
+  record per scope the debit touches. Summing the entry history on every debit would be correct
+  and quadratic, and the quadratic term is invisible until a run gets long.
+* **Arithmetic is integer-exact.** :class:`~baseaicore.Money` is whole nanos, token counts are
+  whole numbers, and nothing here divides. There is no "percentage used" helper, because the
+  obvious implementation of one is a float.
+
+The honesty rules are equally load-bearing. A debit whose cost is absent or untotallable adds its
+tokens and touches no money balance (ADR-0016); a debit whose provider left a token class
+unreported contributes the classes it did report and is counted as unmetered. Both counts ride on
+every verdict, so a balance that is a floor never presents itself as a total.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from baseaicore import Money, TokenUsage, is_supported
+
+from loadledger.errors import CurrencyMismatch
+from loadledger.types import BudgetCeiling, CeilingScope, CeilingVerdict, Debit, LedgerEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from datetime import datetime
+
+    from baseaicore import CostEstimate
+
+__all__ = ["BalanceBook", "Ledger", "utc_day_key", "utc_day_start"]
+
+type _ScopeKey = tuple[CeilingScope, str]
+"""What a balance is filed under: the scope and the value that identifies its window."""
+
+
+def utc_day_start(when: datetime) -> datetime:
+    """Return midnight UTC beginning the calendar day that contains ``when``.
+
+    Args:
+        when: A timezone-aware instant in any timezone. It is converted to UTC first, so an
+            instant expressed as ``23:30-05:00`` lands in the *following* UTC day — which is the
+            whole reason this function exists rather than a ``.replace(hour=0, ...)`` at the call
+            site.
+
+    Returns:
+        The instant of 00:00:00 UTC on that day.
+
+    Raises:
+        ValueError: If ``when`` is naive. A naive instant belongs to whichever day the reader's
+            machine says, which would make the same ledger produce different verdicts in
+            different timezones.
+    """
+    if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+        raise ValueError(
+            "utc_day_start requires a timezone-aware instant; got a naive one. Which UTC day a "
+            "debit falls in decides which per_day ceiling it binds."
+        )
+    in_utc = when.astimezone(UTC)
+    return in_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def utc_day_key(when: datetime) -> str:
+    """Return the ``YYYY-MM-DD`` key naming the UTC calendar day that contains ``when``.
+
+    Args:
+        when: A timezone-aware instant in any timezone, converted to UTC first.
+
+    Returns:
+        The UTC date, e.g. ``"2026-09-02"``. Sortable as a string, which is what makes it usable
+        as a persisted key in Phase 2 without a second representation.
+
+    Raises:
+        ValueError: If ``when`` is naive.
+    """
+    return utc_day_start(when).strftime("%Y-%m-%d")
+
+
+@dataclass(frozen=True, slots=True)
+class _Contribution:
+    """What one debit adds to every scope balance it touches.
+
+    Computed once per debit and applied to each scope, so the honesty rules are decided in one
+    place rather than re-derived per ceiling.
+
+    Attributes:
+        tokens: The sum of the token classes the provider actually reported. Classes left
+            unreported are excluded, never counted as zero.
+        currency: The currency the cost estimate names, whether or not it produced a total.
+            ``None`` when no pricing was applied at all.
+        nanos: The amount to add to the balance for :attr:`currency`. Zero unless the estimate
+            produced a real total.
+        priced: ``True`` only when the estimate produced a real total. The one flag that may
+            create a currency's balance.
+        unpriced: The inverse of :attr:`priced`, carried explicitly because it is what the
+            verdict counts.
+        unmetered: ``True`` when at least one token class was unreported.
+    """
+
+    tokens: int
+    currency: str | None
+    nanos: int
+    priced: bool
+    unpriced: bool
+    unmetered: bool
+
+
+_NOTHING = _Contribution(
+    tokens=0, currency=None, nanos=0, priced=False, unpriced=False, unmetered=False
+)
+"""The contribution of no prospective debit at all — used by ``would_exceed`` with no usage."""
+
+
+def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribution:
+    """Reduce a debit's usage and cost to what it adds to a balance.
+
+    Args:
+        usage: The call's disjoint token counts.
+        cost: The estimate, or ``None`` when no pricing was applied.
+
+    Returns:
+        The contribution. A cost of ``None``, and a cost whose ``total`` is
+        :data:`~baseaicore.UNSUPPORTED`, both yield ``unpriced=True`` and ``nanos=0``: an unknown
+        price adds nothing to a money balance and zeroes nothing already in it. A cost that names
+        a currency still reports that currency even when it could not be totalled, because a
+        ceiling in another currency must refuse it either way.
+    """
+    tokens = 0
+    unmetered = False
+    for count in usage.as_counts().values():
+        if is_supported(count):
+            tokens += count
+        else:
+            unmetered = True
+    if cost is None:
+        return _Contribution(
+            tokens=tokens,
+            currency=None,
+            nanos=0,
+            priced=False,
+            unpriced=True,
+            unmetered=unmetered,
+        )
+    total = cost.total
+    priced = is_supported(total)
+    return _Contribution(
+        tokens=tokens,
+        currency=cost.currency,
+        nanos=total.nanos if is_supported(total) else 0,
+        priced=priced,
+        unpriced=not priced,
+        unmetered=unmetered,
+    )
+
+
+@dataclass(slots=True)
+class _ScopeBalance:
+    """The running totals for one scope window.
+
+    Mutable and private: it is the state :class:`BalanceBook` maintains incrementally. Money is
+    kept per currency and never summed across currencies — a currency absent from
+    :attr:`nanos_by_currency` has had nothing priced in it, which reads differently from zero.
+    """
+
+    tokens_spent: int = 0
+    nanos_by_currency: dict[str, int] = field(default_factory=dict)
+    unpriced_debit_count: int = 0
+    unmetered_debit_count: int = 0
+
+
+_EMPTY_BALANCE = _ScopeBalance()
+"""Read-only stand-in for a window nothing has landed in. Never mutated; never stored."""
+
+
+class BalanceBook:
+    """Incremental per-scope balances and the verdicts a set of ceilings gives over them.
+
+    The engine both :class:`~loadledger.memory.InMemoryLedger` and (in Phase 2) ``SqlLedger``
+    evaluate through, so the arithmetic and the honesty rules have one implementation rather than
+    one per storage backend.
+
+    Not thread-safe on its own: :meth:`record` mutates. Implementations that need concurrency
+    serialize around it — the in-memory ledger takes a lock, and a SQL ledger's transaction is
+    the serialization.
+    """
+
+    __slots__ = ("_balances", "_ceilings")
+
+    def __init__(self, ceilings: Sequence[BudgetCeiling]) -> None:
+        """Build a book over a fixed set of ceilings.
+
+        Args:
+            ceilings: The ceilings to evaluate, already validated by their own constructors.
+                Order is preserved and is the order verdicts come back in, so a caller can pair
+                verdicts with the configuration that produced them positionally.
+        """
+        self._ceilings: tuple[BudgetCeiling, ...] = tuple(ceilings)
+        self._balances: dict[_ScopeKey, _ScopeBalance] = {}
+
+    @property
+    def ceilings(self) -> tuple[BudgetCeiling, ...]:
+        """Return the configured ceilings, in configuration order."""
+        return self._ceilings
+
+    def record(self, debit: Debit, *, occurred_at: datetime) -> None:
+        """Add one debit to every scope balance it touches.
+
+        Constant work per debit in the number of scopes it touches — one dictionary lookup and a
+        handful of integer additions each. Nothing re-reads the entry history, which is what
+        keeps a long run's debits from getting quadratically slower.
+
+        Args:
+            debit: The debit to record. Its currency must already have been checked against the
+                ceilings by :meth:`require_currency_compatible`; this method assumes that and
+                accumulates.
+            occurred_at: The resolved instant the debit happened at, which decides the UTC day
+                its ``PER_DAY`` balance lands in.
+        """
+        contribution = _contribution_of(debit.usage, debit.cost)
+        for key in self._keys_touched(debit.run_id, occurred_at, debit.tags):
+            balance = self._balances.get(key)
+            if balance is None:
+                balance = _ScopeBalance()
+                self._balances[key] = balance
+            balance.tokens_spent += contribution.tokens
+            if contribution.unpriced:
+                balance.unpriced_debit_count += 1
+            if contribution.unmetered:
+                balance.unmetered_debit_count += 1
+            if contribution.priced and contribution.currency is not None:
+                balance.nanos_by_currency[contribution.currency] = (
+                    balance.nanos_by_currency.get(contribution.currency, 0) + contribution.nanos
+                )
+
+    def require_currency_compatible(
+        self,
+        cost: CostEstimate | None,
+        *,
+        run_id: str,
+        at: datetime,
+        tags: tuple[str, ...],
+    ) -> None:
+        """Refuse a priced debit no money ceiling covering it could ever accumulate.
+
+        A money ceiling binds usage in its own currency. If a EUR debit landed in a scope capped
+        in USD, that cap would go on reporting a USD balance that omitted real spend — an
+        under-reporting budget, which is worse than a refusal. Converting instead is not an
+        option: it needs an exchange rate, which is time-varying external data (ADR-0030 rule 3).
+
+        The check is on the currency the estimate *names*, not on whether it produced a total: an
+        estimate that failed to price today is re-costable tomorrow, and the ceiling would still
+        not be able to see the result.
+
+        Args:
+            cost: The estimate, or ``None``. ``None`` names no currency and is never a mismatch —
+                it is unpriced, which the verdict counts instead.
+            run_id: The run the debit belongs to.
+            at: The instant the debit falls at, deciding which ``PER_DAY`` window covers it.
+            tags: The debit's tags, deciding which ``PER_TAG`` ceilings cover it.
+
+        Raises:
+            CurrencyMismatch: If any money ceiling covering this debit is in another currency.
+                ``details`` names both currencies and the ceiling.
+        """
+        if cost is None:
+            return
+        touched = self._keys_touched(run_id, at, tags)
+        for ceiling in self._ceilings:
+            if ceiling.money is None:
+                continue
+            if self._key_for(ceiling, run_id=run_id, at=at) not in touched:
+                continue
+            if ceiling.money.currency != cost.currency:
+                raise CurrencyMismatch(
+                    f"This debit is priced in {cost.currency} but the {ceiling.scope.value} "
+                    f"ceiling covering it is capped in {ceiling.money.currency}. Converting needs "
+                    "an exchange rate this package will not assume; record the spend against a "
+                    "ledger whose ceilings are in its own currency (ADR-0030 rule 3).",
+                    details={
+                        "debit_currency": cost.currency,
+                        "ceiling_currency": ceiling.money.currency,
+                        "ceiling_scope": ceiling.scope.value,
+                        "ceiling_tag": ceiling.tag,
+                    },
+                )
+
+    def verdicts(
+        self,
+        *,
+        run_id: str,
+        at: datetime,
+        usage: TokenUsage | None = None,
+        cost: CostEstimate | None = None,
+        tags: tuple[str, ...] = (),
+    ) -> tuple[CeilingVerdict, ...]:
+        """Evaluate every configured ceiling, optionally including a debit not yet recorded.
+
+        Read-only. Nothing here mutates a balance, which is what makes ``would_exceed`` safe to
+        call from an approval path at any frequency (spec contract 6).
+
+        Args:
+            run_id: The run whose ``PER_RUN`` window to report.
+            at: The instant to resolve the ``PER_DAY`` window at.
+            usage: The token counts of a prospective debit. ``None`` alongside a ``cost`` means
+                the counts were not stated, which is recorded as unmetered rather than as zero.
+            cost: The estimate of a prospective debit, or ``None``.
+            tags: The tags of the prospective debit, deciding which ``PER_TAG`` ceilings it would
+                land in. Ignored when there is no prospective debit.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order. With both ``usage`` and
+            ``cost`` left ``None`` there is no prospective debit at all and the balances are
+            reported as they stand — so asking "would nothing exceed?" is the same question as
+            "what remains?", and gets the same answer. The most restrictive ceiling binds: the
+            caller takes any ``exceeded`` verdict as binding, and every verdict names the cap and
+            the numbers it fired on.
+        """
+        prospective: _Contribution | None = None
+        touched: frozenset[_ScopeKey] = frozenset()
+        if usage is not None or cost is not None:
+            prospective = _contribution_of(usage if usage is not None else TokenUsage(), cost)
+            touched = self._keys_touched(run_id, at, tags)
+        return tuple(
+            self._verdict_for(
+                ceiling,
+                run_id=run_id,
+                at=at,
+                touched=touched,
+                prospective=prospective,
+            )
+            for ceiling in self._ceilings
+        )
+
+    def _verdict_for(
+        self,
+        ceiling: BudgetCeiling,
+        *,
+        run_id: str,
+        at: datetime,
+        touched: frozenset[_ScopeKey],
+        prospective: _Contribution | None,
+    ) -> CeilingVerdict:
+        """Build one ceiling's verdict from its window's balance plus any prospective debit."""
+        key = self._key_for(ceiling, run_id=run_id, at=at)
+        balance = self._balances.get(key, _EMPTY_BALANCE)
+        applies = prospective is not None and key in touched
+        delta = prospective if applies and prospective is not None else _NOTHING
+
+        tokens_spent = balance.tokens_spent + delta.tokens
+        tokens_remaining = None if ceiling.tokens is None else ceiling.tokens - tokens_spent
+
+        money_spent: Money | None = None
+        money_remaining: Money | None = None
+        if ceiling.money is not None:
+            currency = ceiling.money.currency
+            nanos = balance.nanos_by_currency.get(currency)
+            if delta.priced and delta.currency == currency:
+                nanos = (nanos or 0) + delta.nanos
+            if nanos is None:
+                # Nothing priced in this window yet. Reporting Money.zero() here would be the
+                # fabricated zero ADR-0016 exists to prevent; the whole cap does remain.
+                money_remaining = ceiling.money
+            else:
+                money_spent = Money(currency=currency, nanos=nanos)
+                money_remaining = ceiling.money - money_spent
+
+        exceeded = ceiling.tokens is not None and tokens_spent > ceiling.tokens
+        if ceiling.money is not None and money_spent is not None:
+            exceeded = exceeded or money_spent > ceiling.money
+
+        return CeilingVerdict(
+            ceiling=ceiling,
+            exceeded=exceeded,
+            money_spent=money_spent,
+            money_remaining=money_remaining,
+            tokens_spent=tokens_spent,
+            tokens_remaining=tokens_remaining,
+            unpriced_debit_count=balance.unpriced_debit_count + (1 if delta.unpriced else 0),
+            unmetered_debit_count=balance.unmetered_debit_count + (1 if delta.unmetered else 0),
+        )
+
+    def _keys_touched(
+        self, run_id: str, at: datetime, tags: tuple[str, ...]
+    ) -> frozenset[_ScopeKey]:
+        """Return every scope window a debit with these coordinates falls into."""
+        keys: set[_ScopeKey] = {
+            (CeilingScope.PER_RUN, run_id),
+            (CeilingScope.PER_DAY, utc_day_key(at)),
+        }
+        keys.update((CeilingScope.PER_TAG, tag) for tag in tags)
+        return frozenset(keys)
+
+    @staticmethod
+    def _key_for(ceiling: BudgetCeiling, *, run_id: str, at: datetime) -> _ScopeKey:
+        """Return the window key one ceiling reads, for this run at this instant."""
+        if ceiling.scope is CeilingScope.PER_RUN:
+            return (CeilingScope.PER_RUN, run_id)
+        if ceiling.scope is CeilingScope.PER_DAY:
+            return (CeilingScope.PER_DAY, utc_day_key(at))
+        # PER_TAG: the tag is non-None by BudgetCeiling's own validation.
+        return (CeilingScope.PER_TAG, ceiling.tag or "")
+
+
+@runtime_checkable
+class Ledger(Protocol):
+    """What every LoadLedger implementation offers (spec §7).
+
+    :class:`~loadledger.memory.InMemoryLedger` implements it now; ``SqlLedger`` implements it in
+    Phase 2 over the same :class:`BalanceBook`. A caller written against this protocol never
+    learns which one it holds, which is the point: the in-memory ledger is the deterministic
+    double every later phase tests against, not a stub with a reduced surface.
+    """
+
+    def debit(self, debit: Debit) -> LedgerEntry:
+        """Record one debit and return it with every ceiling's verdict as of that debit.
+
+        Exceeding a ceiling is not an error: the entry records ``exceeded=True`` verdicts and the
+        debit stands. Refusing work is the caller's policy.
+
+        Raises:
+            CurrencyMismatch: If the debit is priced in a currency a money ceiling covering it
+                caps in another currency. Refused, never converted.
+        """
+        ...
+
+    def would_exceed(
+        self,
+        run_id: str,
+        *,
+        usage: TokenUsage | None = None,
+        cost: CostEstimate | None = None,
+        tags: tuple[str, ...] = (),
+    ) -> tuple[CeilingVerdict, ...]:
+        """Report what every ceiling would say if this spend were recorded now.
+
+        Side-effect-free, and therefore safe to call from an approval path at any frequency.
+
+        Raises:
+            UnknownRun: If the ledger has never seen ``run_id``.
+            CurrencyMismatch: If the prospective cost is in a currency a money ceiling covering
+                it caps in another currency.
+        """
+        ...
+
+    def remaining(self, run_id: str) -> tuple[CeilingVerdict, ...]:
+        """Report every ceiling's current balance for this run.
+
+        Raises:
+            UnknownRun: If the ledger has never seen ``run_id``.
+        """
+        ...
+
+    def entries(
+        self,
+        *,
+        run_id: str | None = None,
+        tag: str | None = None,
+        since: datetime | None = None,
+    ) -> Sequence[LedgerEntry]:
+        """Return recorded entries, oldest first, narrowed by whichever filters are given.
+
+        ``since`` is inclusive, making the window half-open.
+
+        Raises:
+            ValueError: If ``since`` is naive.
+        """
+        ...
+
+    def declare_run(self, run_id: str) -> None:
+        """Register a run before anything has been debited against it.
+
+        Spec §13 defines a run as existing "once debited or declared"; this is the declaring
+        half, so a caller can ask what a fresh budget allows before spending against it.
+
+        Raises:
+            ValueError: If ``run_id`` is blank.
+        """
+        ...
