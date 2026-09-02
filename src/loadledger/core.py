@@ -15,10 +15,14 @@ Three properties are load-bearing, and each is a named failure mode in the devel
   whole numbers, and nothing here divides. There is no "percentage used" helper, because the
   obvious implementation of one is a float.
 
-The honesty rules are equally load-bearing. A debit whose cost is absent or untotallable adds its
-tokens and touches no money balance (ADR-0016); a debit whose provider left a token class
-unreported contributes the classes it did report and is counted as unmetered. Both counts ride on
-every verdict, so a balance that is a floor never presents itself as a total.
+The honesty rules are equally load-bearing, and one rule covers both sides (ADR-0069): **sum what
+was reported, count what was not.** A debit with no estimate adds its tokens and touches no money
+balance (ADR-0016). A debit whose estimate did not total adds the components that were priced and
+nothing for the rest, and is counted as untotalled. A debit whose provider left a token class
+unreported contributes the classes it did report and is counted as unmetered. Every count rides on
+every verdict, so a balance that is a floor never presents itself as a total — and a ceiling whose
+:class:`~loadledger.types.PartialPricing` is ``STRICT`` treats an untotalled estimate in its window
+as exceeding, so a hard budget is never crossed.
 """
 
 from __future__ import annotations
@@ -30,7 +34,14 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from baseaicore import Money, TokenUsage, is_supported
 
 from loadledger.errors import CurrencyMismatch
-from loadledger.types import BudgetCeiling, CeilingScope, CeilingVerdict, Debit, LedgerEntry
+from loadledger.types import (
+    BudgetCeiling,
+    CeilingScope,
+    CeilingVerdict,
+    Debit,
+    LedgerEntry,
+    PartialPricing,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -98,12 +109,16 @@ class _Contribution:
             unreported are excluded, never counted as zero.
         currency: The currency the cost estimate names, whether or not it produced a total.
             ``None`` when no pricing was applied at all.
-        nanos: The amount to add to the balance for :attr:`currency`. Zero unless the estimate
-            produced a real total.
-        priced: ``True`` only when the estimate produced a real total. The one flag that may
-            create a currency's balance.
-        unpriced: The inverse of :attr:`priced`, carried explicitly because it is what the
-            verdict counts.
+        nanos: The amount to add to the balance for :attr:`currency`: the sum of the estimate's
+            priced components. Equal to the total when the estimate totalled; a floor when it did
+            not; zero when nothing was priced.
+        priced: ``True`` when at least one component was priced. The one flag that may create a
+            currency's balance — an estimate that priced nothing (a price list that does not cover
+            the instant) leaves ``money_spent`` at ``None`` rather than creating a zero.
+        unpriced: ``True`` when the debit added less than its full cost: no estimate, or an
+            estimate that did not total. What the verdict's ``unpriced_debit_count`` counts.
+        untotalled: ``True`` when an estimate was applied and did not total. The subset of
+            :attr:`unpriced` a strict ceiling fires on; a debit with no estimate is not in it.
         unmetered: ``True`` when at least one token class was unreported.
     """
 
@@ -112,28 +127,38 @@ class _Contribution:
     nanos: int
     priced: bool
     unpriced: bool
+    untotalled: bool
     unmetered: bool
 
 
 _NOTHING = _Contribution(
-    tokens=0, currency=None, nanos=0, priced=False, unpriced=False, unmetered=False
+    tokens=0,
+    currency=None,
+    nanos=0,
+    priced=False,
+    unpriced=False,
+    untotalled=False,
+    unmetered=False,
 )
 """The contribution of no prospective debit at all — used by ``would_exceed`` with no usage."""
 
 
 def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribution:
-    """Reduce a debit's usage and cost to what it adds to a balance.
+    """Reduce a debit's usage and cost to what it adds to a balance (ADR-0069).
 
     Args:
         usage: The call's disjoint token counts.
         cost: The estimate, or ``None`` when no pricing was applied.
 
     Returns:
-        The contribution. A cost of ``None``, and a cost whose ``total`` is
-        :data:`~baseaicore.UNSUPPORTED`, both yield ``unpriced=True`` and ``nanos=0``: an unknown
-        price adds nothing to a money balance and zeroes nothing already in it. A cost that names
-        a currency still reports that currency even when it could not be totalled, because a
-        ceiling in another currency must refuse it either way.
+        The contribution. A cost of ``None`` yields ``unpriced=True`` and ``nanos=0``: no price
+        was applied, so nothing is added to any money balance and nothing already in one is
+        zeroed. A cost whose ``total`` is :data:`~baseaicore.UNSUPPORTED` yields ``nanos`` equal
+        to the sum of the components that *were* priced — input and output cost for a response
+        whose cache classes went unreported — with ``unpriced=True`` and ``untotalled=True``, so
+        the balance it lands in is a floor and the verdict says so. A cost that names a currency
+        reports that currency even when it priced nothing, because a ceiling in another currency
+        must refuse it either way.
     """
     tokens = 0
     unmetered = False
@@ -149,16 +174,28 @@ def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribut
             nanos=0,
             priced=False,
             unpriced=True,
+            untotalled=False,
             unmetered=unmetered,
         )
-    total = cost.total
-    priced = is_supported(total)
+    nanos = 0
+    priced = False
+    for component in (
+        cost.input_cost,
+        cost.output_cost,
+        cost.cache_write_cost,
+        cost.cache_read_cost,
+    ):
+        if is_supported(component):
+            nanos += component.nanos
+            priced = True
+    totalled = is_supported(cost.total)
     return _Contribution(
         tokens=tokens,
         currency=cost.currency,
-        nanos=total.nanos if is_supported(total) else 0,
+        nanos=nanos,
         priced=priced,
-        unpriced=not priced,
+        unpriced=not totalled,
+        untotalled=not totalled,
         unmetered=unmetered,
     )
 
@@ -175,6 +212,7 @@ class _ScopeBalance:
     tokens_spent: int = 0
     nanos_by_currency: dict[str, int] = field(default_factory=dict)
     unpriced_debit_count: int = 0
+    untotalled_debit_count: int = 0
     unmetered_debit_count: int = 0
 
 
@@ -235,6 +273,8 @@ class BalanceBook:
             balance.tokens_spent += contribution.tokens
             if contribution.unpriced:
                 balance.unpriced_debit_count += 1
+            if contribution.untotalled:
+                balance.untotalled_debit_count += 1
             if contribution.unmetered:
                 balance.unmetered_debit_count += 1
             if contribution.priced and contribution.currency is not None:
@@ -374,9 +414,20 @@ class BalanceBook:
                 money_spent = Money(currency=currency, nanos=nanos)
                 money_remaining = ceiling.money - money_spent
 
+        untotalled_debit_count = balance.untotalled_debit_count + (1 if delta.untotalled else 0)
+
         exceeded = ceiling.tokens is not None and tokens_spent > ceiling.tokens
         if ceiling.money is not None and money_spent is not None:
             exceeded = exceeded or money_spent > ceiling.money
+        if (
+            ceiling.money is not None
+            and ceiling.partial_pricing is PartialPricing.STRICT
+            and untotalled_debit_count > 0
+        ):
+            # An amount that cannot be shown to be under the cap is treated as over it
+            # (ADR-0069). Not on `unpriced_debit_count`: a local debit with no estimate is
+            # outside the money bound's domain and must not halt a mixed trajectory.
+            exceeded = True
 
         return CeilingVerdict(
             ceiling=ceiling,
@@ -386,6 +437,7 @@ class BalanceBook:
             tokens_spent=tokens_spent,
             tokens_remaining=tokens_remaining,
             unpriced_debit_count=balance.unpriced_debit_count + (1 if delta.unpriced else 0),
+            untotalled_debit_count=untotalled_debit_count,
             unmetered_debit_count=balance.unmetered_debit_count + (1 if delta.unmetered else 0),
         )
 

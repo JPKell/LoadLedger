@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from baseaicore import Money, TokenUsage, canonical_json
+from baseaicore import (
+    ModelIdentity,
+    ModelPricing,
+    Money,
+    PricingSource,
+    ProviderKind,
+    TokenUsage,
+    canonical_json,
+)
 
 from conftest import MIDDAY, ManualClock, cost_of, pricing, rates
 from loadledger import (
@@ -15,6 +23,7 @@ from loadledger import (
     CurrencyMismatch,
     Debit,
     InMemoryLedger,
+    PartialPricing,
 )
 
 
@@ -210,11 +219,12 @@ class TestUnpricedHonesty:
             "'under budget' may not be claimed over an incomplete sum without saying so"
         )
 
-    def test_an_estimate_that_could_not_be_totalled_counts_as_unpriced(
+    def test_an_estimate_that_could_not_be_totalled_adds_only_what_it_priced(
         self, clock: ManualClock
     ) -> None:
         # A price list that predates the provider's cache pricing: a real, non-zero cache read
-        # with no rate for it. The total refuses; the hash of the price that failed is kept.
+        # with no rate for it. The total refuses; the input cost is real and accumulates as a
+        # floor (ADR-0069); the hash of the price that failed is kept.
         gappy = rates("USD", cache_read_per_million=None)
         usage = counted(input_tokens=1_000, cache_read_tokens=500)
         ledger = InMemoryLedger(
@@ -228,10 +238,15 @@ class TestUnpricedHonesty:
                 cost=cost_of(usage, price=pricing(gappy)),
             )
         )
+        verdict = entry.verdicts[0]
         assert entry.unpriced is True
         assert entry.pricing_hash is not None
-        assert entry.verdicts[0].money_spent is None
-        assert entry.verdicts[0].unpriced_debit_count == 1
+        assert verdict.money_spent == usd("0.003"), "1 000 input tokens at $3.00/M, nothing else"
+        assert verdict.money_remaining == usd("4.997")
+        assert verdict.unpriced_debit_count == 1
+        assert verdict.untotalled_debit_count == 1
+        assert verdict.unmetered_debit_count == 0
+        assert verdict.exceeded is False
 
     def test_an_unreported_token_class_is_excluded_not_zeroed(self, clock: ManualClock) -> None:
         ledger = InMemoryLedger(
@@ -263,6 +278,214 @@ class TestUnpricedHonesty:
         assert entry.unpriced is False
         assert entry.verdicts[0].money_spent == usd("0")
         assert entry.verdicts[0].money_remaining == usd("5.00")
+
+
+def adapter_shaped() -> TokenUsage:
+    """What both real ModelRack adapters emit: input and output, cache classes unreported."""
+    return TokenUsage(input_tokens=1_000, output_tokens=500)
+
+
+def expired_pricing() -> ModelPricing:
+    """A price observation whose window closed a month before MIDDAY: it prices nothing at it."""
+    return ModelPricing(
+        identity=ModelIdentity(ProviderKind.OPENAI_COMPATIBLE, "remote-fake-1"),
+        rates=rates(),
+        source=PricingSource.PROVIDER_PUBLISHED,
+        observed_at=MIDDAY - timedelta(days=90),
+        effective_from=MIDDAY - timedelta(days=90),
+        effective_until=MIDDAY - timedelta(days=30),
+    )
+
+
+class TestPartialPricing:
+    """ADR-0069: a partial price is a floor, and a money ceiling chooses how the floor binds."""
+
+    FLOOR_NANOS = 10_500_000
+    """1 000 input at $3.00/M = 3 000 000 nanos, plus 500 output at $15.00/M = 7 500 000."""
+
+    def priced_partially(self, *, source_ref: str = "turn-1") -> Debit:
+        usage = adapter_shaped()
+        return Debit(run_id="traj-1", source_ref=source_ref, usage=usage, cost=cost_of(usage))
+
+    def test_an_adapter_shaped_response_accumulates_its_priced_components(
+        self, clock: ManualClock
+    ) -> None:
+        ledger = InMemoryLedger(
+            [BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("5.00"), tokens=1_000_000)],
+            clock=clock,
+        )
+        entry = ledger.debit(self.priced_partially())
+        verdict = entry.verdicts[0]
+
+        assert entry.unpriced is True, "the estimate did not total"
+        assert verdict.money_spent == Money("USD", self.FLOOR_NANOS)
+        assert verdict.money_remaining == usd("5.00") - Money("USD", self.FLOOR_NANOS)
+        assert verdict.tokens_spent == 1_500
+        assert (
+            verdict.unpriced_debit_count,
+            verdict.untotalled_debit_count,
+            verdict.unmetered_debit_count,
+        ) == (1, 1, 1), "the floor says it is one, on both sides"
+        assert verdict.exceeded is False
+
+    def test_the_floor_is_the_sum_of_the_components_the_total_would_have_been(
+        self, clock: ManualClock
+    ) -> None:
+        # For an estimate that does total, the floor and the total are one number, by BaseAiCore's
+        # own rule that the components a caller displays sum to the total beside them.
+        usage = counted(input_tokens=1_000, output_tokens=500)
+        cost = cost_of(usage)
+        ledger = InMemoryLedger(
+            [BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("5.00"))], clock=clock
+        )
+        verdict = ledger.debit(
+            Debit(run_id="traj-1", source_ref="t", usage=usage, cost=cost)
+        ).verdicts[0]
+        assert verdict.money_spent == cost.total == Money("USD", self.FLOOR_NANOS)
+        assert verdict.untotalled_debit_count == 0
+
+    def test_on_a_floor_exceeded_is_certain_when_true(self, clock: ManualClock) -> None:
+        # The floor alone is over this cap, so the cap has been crossed whatever the cache cost.
+        ledger = InMemoryLedger(
+            [BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("0.01"))], clock=clock
+        )
+        verdict = ledger.debit(self.priced_partially()).verdicts[0]
+        assert verdict.exceeded is True
+        assert verdict.money_remaining == usd("0.01") - Money("USD", self.FLOOR_NANOS)
+
+    def test_on_a_floor_not_exceeded_is_not_certain_and_the_count_says_so(
+        self, clock: ManualClock
+    ) -> None:
+        # The default may fire late: the true cost is unknown, and the verdict carries the count
+        # that tells the reader "under budget" is a floor's opinion.
+        ledger = InMemoryLedger(
+            [BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("0.02"))], clock=clock
+        )
+        verdict = ledger.debit(self.priced_partially()).verdicts[0]
+        assert verdict.exceeded is False
+        assert verdict.unpriced_debit_count == 1
+
+    def test_a_strict_ceiling_fires_on_the_same_debit(self, clock: ManualClock) -> None:
+        ledger = InMemoryLedger(
+            [
+                BudgetCeiling(
+                    scope=CeilingScope.PER_RUN,
+                    money=usd("0.02"),
+                    partial_pricing=PartialPricing.STRICT,
+                )
+            ],
+            clock=clock,
+        )
+        verdict = ledger.debit(self.priced_partially()).verdicts[0]
+        assert verdict.exceeded is True, "cannot be shown to be under the cap, so it is over it"
+        assert verdict.money_spent == Money("USD", self.FLOOR_NANOS), "the floor is still reported"
+        assert verdict.untotalled_debit_count == 1
+
+    def test_a_strict_ceiling_refuses_at_pre_flight_before_any_spend(
+        self, clock: ManualClock
+    ) -> None:
+        ledger = InMemoryLedger(
+            [
+                BudgetCeiling(
+                    scope=CeilingScope.PER_RUN,
+                    money=usd("5.00"),
+                    partial_pricing=PartialPricing.STRICT,
+                )
+            ],
+            clock=clock,
+        )
+        ledger.declare_run("traj-1")
+        usage = adapter_shaped()
+        pre_flight = ledger.would_exceed("traj-1", usage=usage, cost=cost_of(usage))[0]
+        assert pre_flight.exceeded is True
+        assert pre_flight.untotalled_debit_count == 1
+
+        standing = ledger.remaining("traj-1")[0]
+        assert standing.exceeded is False, "nothing was recorded; the refusal was prospective"
+        assert standing.money_spent is None
+
+    def test_a_strict_ceiling_does_not_fire_on_a_debit_with_no_estimate(
+        self, clock: ManualClock
+    ) -> None:
+        # A local model's cost is unsupported by design (ADR-0030); the token ceiling governs it
+        # (ADR-0047 §3). A strict money ceiling on a mixed trajectory must not halt on it.
+        ledger = InMemoryLedger(
+            [
+                BudgetCeiling(
+                    scope=CeilingScope.PER_RUN,
+                    money=usd("5.00"),
+                    tokens=1_000_000,
+                    partial_pricing=PartialPricing.STRICT,
+                )
+            ],
+            clock=clock,
+        )
+        verdict = ledger.debit(debit(usage=counted(input_tokens=1_200, output_tokens=340)))
+        assert verdict.verdicts[0].exceeded is False
+        assert verdict.verdicts[0].unpriced_debit_count == 1
+        assert verdict.verdicts[0].untotalled_debit_count == 0
+        assert verdict.verdicts[0].money_spent is None
+
+    def test_a_strict_ceiling_fires_on_an_estimate_that_priced_nothing(
+        self, clock: ManualClock
+    ) -> None:
+        # A price list that does not cover the instant: every component unsupported. Nothing is
+        # added and no zero is created — and a strict ceiling still fires, because an estimate
+        # was applied and could not show the spend to be under the cap.
+        usage = counted(input_tokens=1_000, output_tokens=500)
+        stale = cost_of(usage, price=expired_pricing())
+        floor = InMemoryLedger(
+            [BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("5.00"))], clock=clock
+        )
+        strict = InMemoryLedger(
+            [
+                BudgetCeiling(
+                    scope=CeilingScope.PER_RUN,
+                    money=usd("5.00"),
+                    partial_pricing=PartialPricing.STRICT,
+                )
+            ],
+            clock=clock,
+        )
+        for ledger in (floor, strict):
+            verdict = ledger.debit(
+                Debit(run_id="traj-1", source_ref="t", usage=usage, cost=stale)
+            ).verdicts[0]
+            assert verdict.money_spent is None, "nothing priced is not a zero"
+            assert verdict.money_remaining == usd("5.00")
+            assert (verdict.unpriced_debit_count, verdict.untotalled_debit_count) == (1, 1)
+        assert floor.remaining("traj-1")[0].exceeded is False
+        assert strict.remaining("traj-1")[0].exceeded is True
+
+    def test_strictness_is_scoped_like_the_ceiling(self, clock: ManualClock) -> None:
+        # A strict per-tag ceiling on the remote tier fires on a partially priced remote response
+        # and says nothing about a run-scoped floor ceiling beside it.
+        ledger = InMemoryLedger(
+            [
+                BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("5.00")),
+                BudgetCeiling(
+                    scope=CeilingScope.PER_TAG,
+                    money=usd("5.00"),
+                    tag="tier:remote_cheap",
+                    partial_pricing=PartialPricing.STRICT,
+                ),
+            ],
+            clock=clock,
+        )
+        usage = adapter_shaped()
+        entry = ledger.debit(
+            Debit(
+                run_id="traj-1",
+                source_ref="t",
+                usage=usage,
+                cost=cost_of(usage),
+                tags=("tier:remote_cheap",),
+            )
+        )
+        per_run, per_tag = entry.verdicts
+        assert per_run.exceeded is False
+        assert per_tag.exceeded is True
+        assert per_run.money_spent == per_tag.money_spent == Money("USD", self.FLOOR_NANOS)
 
 
 class TestCeilingBinding:
@@ -353,18 +576,20 @@ class TestGoldenSerialization:
     def test_verdicts_serialize_to_their_golden_bytes(self) -> None:
         per_run, per_tag = self.build()
         assert per_run == (
-            '{"ceiling":{"money":{"currency":"USD","nanos":5000000000},"scope":"per_run",'
-            '"tag":null,"tokens":2000000},"exceeded":false,'
+            '{"ceiling":{"money":{"currency":"USD","nanos":5000000000},'
+            '"partial_pricing":"floor","scope":"per_run","tag":null,"tokens":2000000},'
+            '"exceeded":false,'
             '"money_remaining":{"currency":"USD","nanos":500000000},'
             '"money_spent":{"currency":"USD","nanos":4500000000},'
             '"tokens_remaining":899400,"tokens_spent":1100600,'
-            '"unmetered_debit_count":0,"unpriced_debit_count":1}'
+            '"unmetered_debit_count":0,"unpriced_debit_count":1,"untotalled_debit_count":0}'
         )
         assert per_tag == (
-            '{"ceiling":{"money":null,"scope":"per_tag","tag":"tier:local_fast","tokens":1000},'
+            '{"ceiling":{"money":null,"partial_pricing":"floor","scope":"per_tag",'
+            '"tag":"tier:local_fast","tokens":1000},'
             '"exceeded":true,"money_remaining":null,"money_spent":null,'
             '"tokens_remaining":-1099000,"tokens_spent":1100000,'
-            '"unmetered_debit_count":0,"unpriced_debit_count":0}'
+            '"unmetered_debit_count":0,"unpriced_debit_count":0,"untotalled_debit_count":0}'
         )
 
     @pytest.mark.contract

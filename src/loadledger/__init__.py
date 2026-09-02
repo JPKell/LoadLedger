@@ -38,7 +38,14 @@ from loadledger.__about__ import __version__
 from loadledger.core import BalanceBook, Ledger, utc_day_key, utc_day_start
 from loadledger.errors import CurrencyMismatch, InvalidCeiling, LedgerError, UnknownRun
 from loadledger.memory import InMemoryLedger
-from loadledger.types import BudgetCeiling, CeilingScope, CeilingVerdict, Debit, LedgerEntry
+from loadledger.types import (
+    BudgetCeiling,
+    CeilingScope,
+    CeilingVerdict,
+    Debit,
+    LedgerEntry,
+    PartialPricing,
+)
 
 __all__ = [
     "BalanceBook",
@@ -52,6 +59,7 @@ __all__ = [
     "Ledger",
     "LedgerEntry",
     "LedgerError",
+    "PartialPricing",
     "UnknownRun",
     "__version__",
     "utc_day_key",

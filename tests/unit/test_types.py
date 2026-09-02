@@ -8,7 +8,14 @@ import pytest
 from baseaicore import UNSUPPORTED, Money, TokenUsage, canonical_json
 
 from conftest import MIDDAY, cost_of
-from loadledger import BudgetCeiling, CeilingScope, CeilingVerdict, Debit, InvalidCeiling
+from loadledger import (
+    BudgetCeiling,
+    CeilingScope,
+    CeilingVerdict,
+    Debit,
+    InvalidCeiling,
+    PartialPricing,
+)
 
 
 def usd(amount: str) -> Money:
@@ -82,7 +89,39 @@ class TestBudgetCeiling:
             "money": {"currency": "USD", "nanos": 5_000_000_000},
             "tokens": None,
             "tag": "tier:remote",
+            "partial_pricing": "floor",
         }
+
+    def test_partial_pricing_defaults_to_floor(self) -> None:
+        assert BudgetCeiling(scope=CeilingScope.PER_RUN, tokens=10).partial_pricing is (
+            PartialPricing.FLOOR
+        )
+
+    def test_partial_pricing_is_keyword_only(self) -> None:
+        # A fifth positional argument is refused: the rule a ceiling binds under must be named.
+        with pytest.raises(TypeError):
+            BudgetCeiling(CeilingScope.PER_RUN, usd("5.00"), None, None, PartialPricing.STRICT)  # type: ignore[misc]
+
+    def test_strict_is_carried_in_the_canonical_form(self) -> None:
+        # An approval record must show which rule its verdict was judged under.
+        ceiling = BudgetCeiling(
+            scope=CeilingScope.PER_RUN, money=usd("5.00"), partial_pricing=PartialPricing.STRICT
+        )
+        assert ceiling.as_canonical()["partial_pricing"] == "strict"
+
+    def test_strict_requires_a_money_bound(self) -> None:
+        with pytest.raises(InvalidCeiling, match="must bind money"):
+            BudgetCeiling(
+                scope=CeilingScope.PER_RUN, tokens=10, partial_pricing=PartialPricing.STRICT
+            )
+
+    def test_partial_pricing_must_be_the_enum(self) -> None:
+        with pytest.raises(InvalidCeiling, match="must be a PartialPricing"):
+            BudgetCeiling(
+                scope=CeilingScope.PER_RUN,
+                money=usd("5.00"),
+                partial_pricing="strict",  # type: ignore[arg-type]
+            )
 
 
 class TestDebit:
@@ -179,7 +218,7 @@ class TestDebit:
 
 
 class TestCeilingVerdict:
-    def test_canonical_form_carries_both_honesty_counts(self) -> None:
+    def test_canonical_form_carries_all_three_honesty_counts(self) -> None:
         ceiling = BudgetCeiling(scope=CeilingScope.PER_RUN, money=usd("5.00"), tokens=100)
         verdict = CeilingVerdict(
             ceiling=ceiling,
@@ -189,6 +228,7 @@ class TestCeilingVerdict:
             tokens_spent=40,
             tokens_remaining=60,
             unpriced_debit_count=2,
+            untotalled_debit_count=1,
             unmetered_debit_count=1,
         )
         assert verdict.as_canonical() == {
@@ -199,6 +239,7 @@ class TestCeilingVerdict:
             "tokens_spent": 40,
             "tokens_remaining": 60,
             "unpriced_debit_count": 2,
+            "untotalled_debit_count": 1,
             "unmetered_debit_count": 1,
         }
 

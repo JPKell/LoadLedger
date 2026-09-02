@@ -17,7 +17,7 @@ Two rules run through every type in this module:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +36,7 @@ __all__ = [
     "CeilingVerdict",
     "Debit",
     "LedgerEntry",
+    "PartialPricing",
 ]
 
 
@@ -66,6 +67,31 @@ class CeilingScope(StrEnum):
     run and every day. PromptCadence uses it for the tier name (``"tier:local_fast"``)."""
 
 
+class PartialPricing(StrEnum):
+    """How a money ceiling treats an estimate in its window that did not total (ADR-0069).
+
+    A provider that leaves a token class unreported — both real ModelRack adapters leave the cache
+    classes unreported — produces a :class:`~baseaicore.CostEstimate` whose priced components are
+    real money and whose ``total`` is :data:`~baseaicore.UNSUPPORTED`. The ledger accumulates the
+    priced components as a **floor** either way; this enum decides what ``exceeded`` means while
+    the sum is a floor. It is the operator's choice, carried on the ceiling so that
+    ``would_exceed`` applies it at pre-flight and every approval record shows which rule the
+    verdict was judged under.
+    """
+
+    FLOOR = "floor"
+    """Bind on what was priced. ``exceeded`` is certain when ``True`` (the floor is already over
+    the cap) and not certain when ``False``; the brake may fire late, by at most the unreported
+    portion, and never early. The default."""
+
+    STRICT = "strict"
+    """An estimate in the window that did not total counts as exceeding the cap: an amount that
+    cannot be shown to be under the limit is treated as over it. The brake fires early and the cap
+    is never crossed. Trips on ``untotalled_debit_count``, never on a debit that carried no
+    estimate at all, so a local step on a mixed trajectory does not halt it (ADR-0047 §3 governs
+    local execution with the token ceiling). Requires a money bound."""
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetCeiling:
     """A cap — money, tokens, or both — over one :class:`CeilingScope`.
@@ -87,18 +113,24 @@ class BudgetCeiling:
             means this ceiling does not bind tokens.
         tag: The tag this ceiling is over. Required for :attr:`CeilingScope.PER_TAG` and refused
             for every other scope, because a tag on a per-run ceiling would silently do nothing.
+        partial_pricing: What ``exceeded`` means while the money balance is a floor
+            (:class:`PartialPricing`, ADR-0069). Keyword-only. :attr:`PartialPricing.FLOOR` binds
+            on what was priced and may fire late; :attr:`PartialPricing.STRICT` treats an estimate
+            that did not total as exceeding, and is refused on a ceiling with no money bound.
 
     Raises:
         InvalidCeiling: If neither bound is set; if ``money`` is not
             :class:`~baseaicore.Money` or is negative; if ``tokens`` is not a whole number or is
-            negative; if a ``PER_TAG`` ceiling has no tag or a blank one; or if any other scope
-            was given a tag.
+            negative; if a ``PER_TAG`` ceiling has no tag or a blank one; if any other scope was
+            given a tag; if ``partial_pricing`` is not a :class:`PartialPricing`; or if it is
+            ``STRICT`` on a ceiling that binds no money.
     """
 
     scope: CeilingScope
     money: Money | None = None
     tokens: int | None = None
     tag: str | None = None
+    partial_pricing: PartialPricing = field(default=PartialPricing.FLOOR, kw_only=True)
 
     def __post_init__(self) -> None:
         """Validate the bounds and the tag rules.
@@ -152,20 +184,36 @@ class BudgetCeiling:
                 "per_tag ceilings are filtered by tag, so a tag here would silently do nothing.",
                 details={"field": "tag", "scope": self.scope.value, "value": self.tag},
             )
+        if not isinstance(self.partial_pricing, PartialPricing):
+            raise InvalidCeiling(
+                f"BudgetCeiling.partial_pricing must be a PartialPricing; got "
+                f"{self.partial_pricing!r}.",
+                details={"field": "partial_pricing", "value": repr(self.partial_pricing)},
+            )
+        if self.partial_pricing is PartialPricing.STRICT and self.money is None:
+            raise InvalidCeiling(
+                f"A strict {self.scope.value} ceiling must bind money; this one binds no money. "
+                "Strictness says what an estimate that did not total means for the money cap, "
+                "and this ceiling has no money cap for it to mean anything to.",
+                details={"field": "partial_pricing", "scope": self.scope.value},
+            )
 
     def as_canonical(self) -> dict[str, Any]:
         """Return the mapping form used inside canonical JSON, and therefore inside goldens.
 
         Returns:
-            ``{"scope": ..., "money": {"currency", "nanos"} | None, "tokens": ..., "tag": ...}``.
-            Equal ceilings always produce the same mapping, which is what spec contract 4's
-            byte-identical verdict serialization rests on.
+            ``{"scope": ..., "money": {"currency", "nanos"} | None, "tokens": ..., "tag": ...,
+            "partial_pricing": ...}``. Equal ceilings always produce the same mapping, which is
+            what spec contract 4's byte-identical verdict serialization rests on; the partial
+            pricing rule is in it so an approval record shows which rule its verdict was judged
+            under.
         """
         return {
             "scope": self.scope.value,
             "money": self.money.as_canonical() if self.money is not None else None,
             "tokens": self.tokens,
             "tag": self.tag,
+            "partial_pricing": self.partial_pricing.value,
         }
 
 
@@ -280,28 +328,41 @@ class CeilingVerdict:
     records, so their serialized form is byte-stable (spec contract 4).
 
     Attributes:
-        ceiling: The ceiling this verdict is about.
+        ceiling: The ceiling this verdict is about, including its :class:`PartialPricing` rule.
         exceeded: ``True`` when the balance is **strictly greater** than a bound this ceiling
-            sets. Spending exactly the cap is not exceeding it. With several ceilings active the
-            caller takes the most restrictive answer by taking any ``exceeded`` as binding —
-            there is no arithmetic to get wrong, and each verdict says which cap fired.
-        money_spent: What has been spent, in the ceiling's currency, in this window. ``None`` when
-            the ceiling binds no money, and ``None`` when nothing has been priced in this scope
-            yet — which is not the same as zero, and is the reason this field is not
-            ``Money.zero()`` (ADR-0016).
+            sets. Spending exactly the cap is not exceeding it. Under
+            :attr:`PartialPricing.STRICT`, also ``True`` whenever :attr:`untotalled_debit_count`
+            is non-zero: an amount that cannot be shown to be under the cap is treated as over it
+            (ADR-0069). With several ceilings active the caller takes the most restrictive answer
+            by taking any ``exceeded`` as binding — there is no arithmetic to get wrong, and each
+            verdict says which cap fired. While :attr:`money_spent` is a floor, ``True`` is
+            certain and ``False`` is not.
+        money_spent: What has been spent, in the ceiling's currency, in this window: the sum of
+            every priced component of every debit landing here. ``None`` when the ceiling binds
+            no money, and ``None`` when nothing has been priced in this scope yet — which is not
+            the same as zero, and is the reason this field is not ``Money.zero()`` (ADR-0016). A
+            **floor** whenever :attr:`unpriced_debit_count` is non-zero; render it as "at least",
+            never as a bare figure.
         money_remaining: ``ceiling.money`` less :attr:`money_spent`, or the whole cap when nothing
             has been priced yet. ``None`` when the ceiling binds no money. May be negative: a
-            crossed budget reports how far past it went rather than clamping at zero.
+            crossed budget reports how far past it went rather than clamping at zero. An upper
+            bound on what is left whenever :attr:`money_spent` is a floor.
         tokens_spent: Tokens counted in this window, summed over the classes providers actually
             reported.
         tokens_remaining: ``ceiling.tokens`` less :attr:`tokens_spent`, or ``None`` when the
             ceiling binds no tokens. May be negative.
-        unpriced_debit_count: How many debits in this window carried no cost, or a cost that
-            could not be totalled. Their tokens are in :attr:`tokens_spent`; their money is in no
-            balance at all. A non-zero count means :attr:`money_spent` is a floor, not a total —
-            so "under budget" is never claimed over an incomplete sum without saying so (spec
-            contract 2). Deciding what to do about it is the application's policy, not this
+        unpriced_debit_count: How many debits in this window added less than their full cost: no
+            estimate at all, or an estimate that did not total. Their tokens are in
+            :attr:`tokens_spent`; only the components that were priced are in
+            :attr:`money_spent`. A non-zero count means :attr:`money_spent` is a floor, not a
+            total — so "under budget" is never claimed over an incomplete sum without saying so
+            (spec contract 2). Deciding what to do about it is the application's policy, not this
             package's: see :mod:`loadledger.errors`.
+        untotalled_debit_count: The subset of :attr:`unpriced_debit_count` that carried an
+            estimate which did not total — a priced response the provider did not fully report,
+            or a price list that does not cover the instant. This is what a
+            :attr:`PartialPricing.STRICT` ceiling fires on; a debit with no estimate (a local
+            model) is in the unpriced count and not here.
         unmetered_debit_count: How many debits in this window left at least one token class
             unreported. Those classes are excluded from :attr:`tokens_spent` rather than counted
             as zero, so a non-zero count means the token balance is a floor too.
@@ -314,6 +375,7 @@ class CeilingVerdict:
     tokens_spent: int
     tokens_remaining: int | None
     unpriced_debit_count: int = 0
+    untotalled_debit_count: int = 0
     unmetered_debit_count: int = 0
 
     def as_canonical(self) -> dict[str, Any]:
@@ -336,6 +398,7 @@ class CeilingVerdict:
             "tokens_spent": self.tokens_spent,
             "tokens_remaining": self.tokens_remaining,
             "unpriced_debit_count": self.unpriced_debit_count,
+            "untotalled_debit_count": self.untotalled_debit_count,
             "unmetered_debit_count": self.unmetered_debit_count,
         }
 

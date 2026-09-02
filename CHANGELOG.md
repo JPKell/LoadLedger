@@ -24,6 +24,17 @@ packaging and release standards §3.
   BaseAiCore's own pattern — spec contract 4 requires byte-identical verdict serializations, and
   `baseaicore.canonical_json` needs a mapping form to produce them. `Debit.as_canonical` omits
   the cost deliberately: usage and `pricing_hash` are the stored facts (ADR-0030 rule 1).
+- `PartialPricing` and the keyword-only `BudgetCeiling.partial_pricing` (default `FLOOR`;
+  `STRICT` requires a money bound, else `InvalidCeiling`), and `CeilingVerdict.untotalled_debit_count`
+  — the subset of the unpriced count that carried an estimate which did not total, which is what
+  a strict ceiling fires on. Both appear in the canonical forms, so the goldens changed (ADR-0069).
+
+### Changed
+- A debit whose estimate did not total now accumulates the components that *were* priced into the
+  money balance as a floor, instead of adding nothing (ADR-0069, reversing spec contract 2 as
+  first written). On a floor, `exceeded` is certain when `True` and not when `False`; a `STRICT`
+  ceiling treats an untotalled estimate in its window as exceeding, at pre-flight too. A debit
+  with no estimate still touches no money balance, and never trips a strict ceiling.
 
 ### Deferred
 - `loadledger.sql`, `mount_ledger_tables`, `SqlLedger` and the `[sql]` extra — Phase 2 (ADR-0050).

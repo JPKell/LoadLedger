@@ -32,9 +32,18 @@ LoadLedger is that accumulator, and it is deliberately nothing else:
 * **It never stores money as the record of truth.** An entry holds `TokenUsage` and a
   `pricing_hash`; the money is re-derived, so a price correction has somewhere to go
   (ADR-0030 rule 1).
-* **Unpriced is not free.** An unpriced debit accumulates tokens, leaves every money balance
-  untouched, and puts its count on the money verdict — so "under budget" is never claimed over an
-  incomplete sum without saying so (ADR-0016).
+* **Unpriced is not free, and a partial price is a floor.** A debit with no estimate accumulates
+  tokens and leaves every money balance untouched. A debit whose estimate did not total — the
+  ordinary case for an adapter that leaves the cache classes unreported — adds the components that
+  *were* priced and nothing for the rest. Every money verdict carries the counts that make its
+  figure a floor, so "under budget" is never claimed over an incomplete sum without saying so
+  (ADR-0016, ADR-0069). Render a floor as "at least", never as a bare figure.
+* **The operator chooses how a floor binds.** By default a ceiling binds on the floor: `exceeded`
+  is certain when `True` and not when `False`, so the brake may fire late by the unreported
+  portion. `BudgetCeiling(..., partial_pricing=PartialPricing.STRICT)` reverses that for a hard
+  budget — an estimate in the window that did not total counts as exceeding, at pre-flight too, and
+  the cap is never crossed. Strict trips on an estimate that did not total, never on a local debit
+  that carried no estimate.
 
 ## Quickstart
 
@@ -72,6 +81,18 @@ entry = ledger.debit(
 verdict = entry.verdicts[0]
 print(verdict.tokens_spent, verdict.money_spent, verdict.unpriced_debit_count)
 # 912000 None 1     -- '—', not '$0.00'
+```
+
+For a budget that must not be crossed, make the money ceiling strict:
+
+```python
+from loadledger import PartialPricing
+
+hard = BudgetCeiling(
+    scope=CeilingScope.PER_RUN,
+    money=Money.from_decimal("USD", "5.00"),
+    partial_pricing=PartialPricing.STRICT,  # a response the provider did not fully price
+)  # counts as exceeding — never fires late
 ```
 
 `PER_DAY` means a **UTC** calendar day. A budget that reset at the machine's local midnight would
