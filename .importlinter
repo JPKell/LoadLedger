@@ -1,0 +1,38 @@
+[importlinter]
+root_package = loadledger
+include_external_packages = True
+
+[importlinter:contract:no-application-imports]
+name = LoadLedger must not import applications
+type = forbidden
+source_modules = loadledger
+forbidden_modules =
+    freeweight
+    loadcoach
+    ideapress
+    promptcadence
+
+[importlinter:contract:no-sibling-packages]
+name = LoadLedger must not import sibling capability packages
+type = forbidden
+source_modules = loadledger
+forbidden_modules =
+    setspec
+    modelrack
+    sweatmeter
+    weightsdb
+    mirrorwall
+    cutctx
+    toolyard
+    spotcheck
+
+[importlinter:contract:no-sql-in-phase-1]
+# ADR-0050 §4: `sqlalchemy` is an optional extra so the pure-value core stays installable with
+# nothing but baseaicore. Until Phase 2 adds `loadledger.sql`, no module here may import it, and
+# after Phase 2 this contract is replaced by one that exempts `loadledger.sql` alone.
+name = LoadLedger must not import sqlalchemy before Phase 2
+type = forbidden
+source_modules = loadledger
+forbidden_modules =
+    sqlalchemy
+    alembic

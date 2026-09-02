@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loadledger"
+description = "Budget accumulation and ceilings over ADR-0030's cost types: debits, per-scope balances, and explicable ceiling verdicts. No pricing, no conversion, no policy."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dynamic = ["version"]
+authors = [{ name = "Local AI Suite contributors" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    # The only runtime dependency, and the only one Phase 1 is permitted (gold standards §2:
+    # LoadLedger's non-suite dependency budget is 0). `Money`, `TokenUsage`, `CostEstimate`,
+    # `UNSUPPORTED`, `Clock` and `SuiteError` all ship in 0.4.0; the range is the suite's
+    # existing pin, so 0.4.1 satisfies it unchanged.
+    "baseaicore>=0.4,<0.5",
+]
+
+[project.optional-dependencies]
+# No `sql` extra yet. `loadledger.sql` and `SqlLedger` arrive in Phase 2 (development plan);
+# declaring the extra ahead of the module would advertise an import that does not exist.
+dev = [
+    # >=9.0.3 excludes PYSEC-2026-1845 (vulnerable /tmp/pytest-of-{user} handling,
+    # affecting pytest through 9.0.2). Matches the pin BaseAiCore, SetSpec, ModelRack,
+    # SweatMeter, WeightsDB and MirrorWall already moved to.
+    "pytest>=9.0.3,<10",
+    "pytest-cov>=5,<6",
+    "pytest-randomly>=3,<4",
+    "mypy>=1.11,<2",
+    "ruff>=0.6,<1",
+    "import-linter>=2.0,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/JPKell/LoadLedger"
+Documentation = "https://github.com/JPKell/LoadLedger/tree/main/docs"
+Changelog = "https://github.com/JPKell/LoadLedger/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/loadledger/__about__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loadledger"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "T20", "DTZ", "PTH", "D1", "BLE"]
+ignore = ["D100", "D104"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "D1"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live and not performance'"
+markers = [
+    "live: requires a real provider/GPU, never in default CI",
+    "performance: performance budget assertions, excluded by default",
+    "contract: public API/schema conformance in both directions",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+# The importable name, not the source path: CI installs the built distribution rather than an
+# editable checkout (Packaging Standards §4), so coverage must find the package wherever it is
+# installed. `paths` folds the two locations into one name in the report.
+source = ["loadledger"]
+branch = true
+
+[tool.coverage.paths]
+source = ["src/loadledger", "*/site-packages/loadledger"]
+
+[tool.coverage.report]
+# Shared packages carry a 95% floor, not the 85% applications use.
+fail_under = 95
+show_missing = true
