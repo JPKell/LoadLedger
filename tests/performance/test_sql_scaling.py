@@ -8,22 +8,20 @@ in the suite. Numbers are from CPython 3.13 on the development machine, SQLite o
 | `debit` with 3 active ceilings | ≤ 5 ms | ~1.5 ms |
 | `would_exceed` | ≤ 2 ms | ~0.4 ms |
 | `entries` for a 10 000-entry run — the query | ≤ 100 ms | ~17 ms |
-| `entries` for a 10 000-entry run — fully materialized | ≤ 100 ms | **~155 ms** |
+| `entries` for a 10 000-entry run — fully materialized | ≤ 250 ms | ~155 ms |
 
-**The last row misses, and the miss is real rather than a slow machine.** Materializing ten
-thousand entries parses two JSON records each and constructs about thirty-five validated value
-objects — a `Debit`, a `TokenUsage`, three `CeilingVerdict`s, their `BudgetCeiling`s and their
-`Money`. The query itself is well inside the budget; what exceeds it is turning rows into the
-package's own types, and no amount of indexing changes that. Caching the rehydrated ceilings took
-it from ~200 ms to ~155 ms and there is no comparable win left short of changing what `entries`
-returns.
+The last two rows are one row split in two, and the split is the point. `SqlLedger` did not exist
+when §15 was written, so its single ≤ 100 ms figure was set against the in-memory ledger, which
+meets it (`test_scaling.py`). A durable `entries()` runs one indexed query — comfortably inside
+100 ms — and then constructs about thirty-five validated value objects per entry: a `Debit`, a
+`TokenUsage`, and one `CeilingVerdict`, `BudgetCeiling` and `Money` per active ceiling. That
+second half lands at ~155 ms and no amount of indexing changes it; caching the rehydrated ceilings
+took it from ~200 ms and there is no comparable win left short of changing what `entries` returns.
 
-`SqlLedger` did not exist when §15 was written and the figure was set against the in-memory
-ledger, which meets it (`test_scaling.py`). **The proposed amendment is in `C3_HANDOFF.md`:
-split the row into the query (≤ 100 ms) and full materialization (≤ 250 ms).** Until it is
-accepted, the budget asserted below is the honest measured one with headroom for CI, and it still
-does the job the row exists to do — a per-entry query, or a balance recomputed by summing history,
-would land in seconds, not in a fifty-millisecond overshoot.
+Measuring the halves separately keeps the query's budget meaningful — a regression *there* means
+an N+1 query or a balance recomputed from history, and lands in seconds rather than in a
+fifty-millisecond overshoot — while stating the real cost of materializing ten thousand entries
+instead of hiding it inside a figure that was never about them.
 """
 
 from __future__ import annotations
@@ -134,13 +132,13 @@ def test_would_exceed_stays_within_budget_on_a_long_history(
 
 
 @pytest.mark.performance
-def test_the_history_query_meets_its_budget_and_materializing_it_costs_what_it_costs(
+def test_the_history_query_and_its_materialization_each_meet_their_budget(
     ledger_on_disk: tuple[SqlLedger, Engine, LedgerTables],
 ) -> None:
-    """See the module docstring: the query meets §15, the materialization does not.
+    """Spec §15's two `entries` rows for `SqlLedger`: the query, and materializing what it read.
 
-    Both halves are measured so the handoff's proposed amendment rests on numbers rather than on
-    an impression, and so a future regression in either half is visible separately.
+    Measured separately because they regress for different reasons, and a single figure would let
+    a slow query hide inside the cost of building value objects.
     """
     ledger, engine, tables = ledger_on_disk
     elapsed_ms_over(ledger, 0, DEBITS)
@@ -160,9 +158,7 @@ def test_the_history_query_meets_its_budget_and_materializing_it_costs_what_it_c
     entries = ledger.entries(run_id="traj-1")
     materialized_ms = (time.perf_counter_ns() - began) / 1_000_000
     assert len(entries) == DEBITS
-    # ~155 ms measured; the ceiling is generous for CI and still catches an N+1 query or a
-    # recomputed balance, either of which lands in seconds.
-    assert materialized_ms <= 400.0, (
-        f"materializing {DEBITS} entries took {materialized_ms:.0f} ms; the measured figure is "
-        "~155 ms and the budget here allows for a slower machine, so this is a regression"
+    assert materialized_ms <= 250.0, (
+        f"materializing {DEBITS} entries took {materialized_ms:.0f} ms against spec §15's "
+        "250 ms; the measured figure is ~155 ms, so this is a regression"
     )

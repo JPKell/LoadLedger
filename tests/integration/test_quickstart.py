@@ -13,6 +13,7 @@ as nobody tried it.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,10 +21,29 @@ from pathlib import Path
 QUICKSTART = Path(__file__).parents[2] / "docs" / "quickstart.py"
 
 
+def without_coverage(environment: dict[str, str]) -> dict[str, str]:
+    """Return ``environment`` with pytest-cov's subprocess hooks removed.
+
+    This child runs with ``cwd`` set to a temporary directory — deliberately, since that is where
+    the script writes its database — so it cannot find ``pyproject.toml`` and would measure itself
+    **without** ``branch = true``. The resulting ``.coverage.*`` file then refuses to combine with
+    the branch data every other process wrote ("Can't combine statement coverage data with branch
+    data"), and the whole coverage run fails with an `INTERNALERROR` that says nothing about a
+    working directory. The child's coverage is not wanted anyway: what is under test here is that
+    the published script runs, not which of its lines did.
+    """
+    return {
+        name: value
+        for name, value in environment.items()
+        if not name.startswith(("COV_CORE", "COVERAGE"))
+    }
+
+
 def test_the_published_quickstart_runs_and_prints_honest_balances(tmp_path: Path) -> None:
     finished = subprocess.run(  # noqa: S603 — a fixed argv, no shell, no user input
         [sys.executable, str(QUICKSTART)],
         cwd=tmp_path,
+        env=without_coverage(dict(os.environ)),
         capture_output=True,
         check=False,
         text=True,
