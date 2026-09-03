@@ -17,7 +17,13 @@ from typing import ClassVar
 
 from baseaicore import SuiteError
 
-__all__ = ["CurrencyMismatch", "InvalidCeiling", "LedgerError", "UnknownRun"]
+__all__ = [
+    "CurrencyMismatch",
+    "InvalidCeiling",
+    "LedgerError",
+    "UnknownRun",
+    "UnsupportedDialect",
+]
 
 
 class LedgerError(SuiteError):
@@ -63,3 +69,17 @@ class UnknownRun(LedgerError):
     """
 
     code: ClassVar[str] = "LEDGER_UNKNOWN_RUN"
+
+
+class UnsupportedDialect(LedgerError):
+    """A session was bound to a database this package has no statements for.
+
+    The suite runs on exactly two dialects — SQLite and PostgreSQL, both first-class
+    (:doc:`ADR-0006 <adr>`) — and :class:`~loadledger.sql.SqlLedger`'s balance upsert is written
+    for both. A third dialect is refused at the first statement rather than discovered as a syntax
+    error partway through a money transaction. ``details`` names the dialect that was bound.
+
+    Raised only from ``loadledger.sql``; the pure core never sees a database.
+    """
+
+    code: ClassVar[str] = "LEDGER_UNSUPPORTED_DIALECT"
