@@ -77,6 +77,10 @@ ignore = ["D100", "D104"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "D1"]
+# `docs/quickstart.py` is the demonstrable script spec §20 criterion 2 asks for: printing is what
+# it is for, and its one assert states a fact about the estimate it just built. Everything else
+# under `docs/` is mirrored markdown, which ruff does not read.
+"docs/*.py" = ["S101", "T20"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
