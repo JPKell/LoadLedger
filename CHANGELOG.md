@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 [Semantic Versioning](https://semver.org/), pre-1.0 per
 packaging and release standards §3.
 
-## [Unreleased]
+## [0.1.0] — 2026-09-02
 
 ### Added
 - Repository scaffold: toolchain copied from `py/WeightsDB` (hatchling, ruff, mypy strict,
@@ -36,5 +36,44 @@ packaging and release standards §3.
   ceiling treats an untotalled estimate in its window as exceeding, at pre-flight too. A debit
   with no estimate still touches no money balance, and never trips a strict ceiling.
 
-### Deferred
-- `loadledger.sql`, `mount_ledger_tables`, `SqlLedger` and the `[sql]` extra — Phase 2 (ADR-0050).
+- Phase 2, the durable half: `loadledger.sql` under the new `loadledger[sql]` extra (ADR-0050).
+  - `mount_ledger_tables(metadata, *, prefix="ledger_") -> LedgerTables` adds four tables —
+    `ledger_entries`, `ledger_balances`, `ledger_balance_money`, `ledger_runs` — to an
+    application's own `MetaData`, so they appear in the application's own Alembic autogenerate and
+    the application owns the rows, the backups and the retention. The package owns no engine, no
+    session, no URL, no environment variable, no file and no migration history; `create_all`
+    appears nowhere in `src/`, and nothing is created on import.
+  - `SqlLedger(session_factory, ceilings, *, clock, table_prefix="ledger_")` implements the whole
+    `Ledger` protocol, `declare_run` included, over one injected session factory. It evaluates
+    through the same `BalanceBook` as `InMemoryLedger`, so the arithmetic and the honesty rules
+    have one implementation and not one per backend.
+  - `LedgerTables`, a frozen handle with `prefix`, `entries`, `balances`, `balance_money`, `runs`,
+    `metadata` and `all_tables`.
+  - `UnsupportedDialect` (`LEDGER_UNSUPPORTED_DIALECT`): ADR-0006 admits SQLite and PostgreSQL, and
+    a third dialect is refused at the first statement rather than found as a syntax error inside a
+    money transaction. Beyond spec §7's error table; amendment proposed in `C3_HANDOFF.md`.
+  - `loadledger.core` gains the seams a durable ledger needs, all documented: `DebitContribution`,
+    `contribution_of`, `BalanceBook.windows_touched` / `window_for` / `seed`, `resolved_debit` and
+    `is_unpriced`. The package's top-level `__all__` is unchanged.
+- `docs/quickstart.md` and the standalone `docs/quickstart.py` it publishes the output of (spec §20
+  acceptance criterion 2), with a test that runs the script so it cannot rot.
+- `docs/mounted-table-upgrades.md`: the upgrade-note template and migration recipe LoadLedger ships
+  when a mounted table changes shape, since the host owns every migration (spec §19, ADR-0050
+  decision 5), with one worked example.
+- CI gains a `db-matrix` job running the integration tests against PostgreSQL 16 with
+  `LOADLEDGER_REQUIRE_POSTGRES=1`, so a dialect cannot be skipped into a green run.
+
+### Changed
+- `.importlinter`'s `no-sql-in-phase-1` is **replaced** by
+  `only-the-sql-module-imports-sqlalchemy`: same forbidden modules, one ignored import for
+  `loadledger.sql -> sqlalchemy`, and no exemption at all for `alembic`. The `no-sibling-packages`
+  contract's `spotcheck` entry gains `commissioner`, the package's name since `7077cc4`; the old
+  spelling is kept, because a forbidden module that no longer exists forbids nothing.
+- `pytest` `addopts` gains `-ra`, so a skipped PostgreSQL leg always names itself in the summary.
+
+### Known limitation
+- `entries()` for a 10 000-entry run materializes in ~155 ms against spec §15's 100 ms. The query
+  itself takes ~17 ms; the overshoot is constructing ten thousand validated value objects, and no
+  indexing changes it. A split of that §15 row — query ≤ 100 ms, full materialization ≤ 250 ms — is
+  proposed in `C3_HANDOFF.md`. `debit` (~1.5 ms against 5 ms) and `would_exceed` (~0.4 ms against
+  2 ms) are inside budget, and `debit` does not slow down as history grows.

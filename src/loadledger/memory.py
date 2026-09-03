@@ -1,10 +1,12 @@
 """``InMemoryLedger`` — the process-local ledger, and the deterministic double (spec §7, §10).
 
 First-class, not a stub. It implements the whole :class:`~loadledger.core.Ledger` protocol with
-the same :class:`~loadledger.core.BalanceBook` a SQL-backed ledger will use in Phase 2, so a
+the same :class:`~loadledger.core.BalanceBook` :class:`~loadledger.sql.SqlLedger` uses, so a
 consumer that tests against this one is testing the arithmetic it will run in production. What it
 does not do is survive the process — it owns no storage, and it says so here rather than letting
-a caller discover it after a restart (spec §10: LoadLedger owns no data).
+a caller discover it after a restart (spec §10: LoadLedger owns no data). For a ledger that does
+survive, mount the tables into an application's own database and use
+:class:`~loadledger.sql.SqlLedger`; it is observably this ledger with a different store.
 
 Determinism is the reason it exists. Given the same clock, the same ceilings and the same debits,
 it produces the same verdicts in the same order, byte-identical when serialized (spec contract 4).

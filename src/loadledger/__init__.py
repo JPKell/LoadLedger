@@ -6,8 +6,11 @@ crossed**. There is no pricing here (prices arrive as ``ModelPricing`` records t
 acquired), no currency conversion (ADR-0030 rule 3), and no policy — the ledger answers "would
 this exceed?" and "what remains?", and halting, pausing or re-approving is the caller's decision.
 
-Phase 1 is pure: no I/O, no SQL, no logging, no environment. ``loadledger.sql`` and ``SqlLedger``
-arrive in Phase 2 as the ``loadledger[sql]`` extra (ADR-0050).
+This module is pure: no I/O, no SQL, no logging, no environment, and `baseaicore` is its only
+dependency. Durability lives in ``loadledger.sql`` — ``mount_ledger_tables`` and ``SqlLedger``,
+under the ``loadledger[sql]`` extra — which is deliberately **not** imported here, so installing
+this package never drags in an ORM (ADR-0050 decision 4). Import it explicitly:
+``from loadledger.sql import SqlLedger``.
 
     >>> from datetime import UTC, datetime
     >>> from baseaicore import Money, TokenUsage

@@ -99,7 +99,8 @@ def utc_day_key(when: datetime) -> str:
 
     Returns:
         The UTC date, e.g. ``"2026-09-02"``. Sortable as a string, which is what makes it usable
-        as a persisted key in Phase 2 without a second representation.
+        as :class:`~loadledger.sql.SqlLedger`'s persisted window key without a second
+        representation.
 
     Raises:
         ValueError: If ``when`` is naive.
@@ -279,9 +280,11 @@ _EMPTY_BALANCE = _ScopeBalance()
 class BalanceBook:
     """Incremental per-scope balances and the verdicts a set of ceilings gives over them.
 
-    The engine both :class:`~loadledger.memory.InMemoryLedger` and (in Phase 2) ``SqlLedger``
-    evaluate through, so the arithmetic and the honesty rules have one implementation rather than
-    one per storage backend.
+    The engine both :class:`~loadledger.memory.InMemoryLedger` and
+    :class:`~loadledger.sql.SqlLedger` evaluate through, so the arithmetic and the honesty rules
+    have one implementation rather than one per storage backend. A durable ledger loads the
+    windows its ceilings read (:meth:`window_for`), installs them with :meth:`seed`, and asks
+    for :meth:`verdicts` — the rest of this class does not know where a balance came from.
 
     Not thread-safe on its own: :meth:`record` mutates. Implementations that need concurrency
     serialize around it — the in-memory ledger takes a lock, and a SQL ledger's transaction is
@@ -592,8 +595,8 @@ class BalanceBook:
 class Ledger(Protocol):
     """What every LoadLedger implementation offers (spec §7).
 
-    :class:`~loadledger.memory.InMemoryLedger` implements it now; ``SqlLedger`` implements it in
-    Phase 2 over the same :class:`BalanceBook`. A caller written against this protocol never
+    :class:`~loadledger.memory.InMemoryLedger` and :class:`~loadledger.sql.SqlLedger` both
+    implement it, over the same :class:`BalanceBook`. A caller written against this protocol never
     learns which one it holds, which is the point: the in-memory ledger is the deterministic
     double every later phase tests against, not a stub with a reduced surface.
     """
