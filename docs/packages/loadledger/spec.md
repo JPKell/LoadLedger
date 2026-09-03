@@ -124,6 +124,9 @@ class Ledger(Protocol):
     def remaining(self, run_id: str) -> tuple[CeilingVerdict, ...]: ...
     def entries(self, *, run_id: str | None = None, tag: str | None = None,
                 since: datetime | None = None) -> Sequence[LedgerEntry]: ...
+        # `since` is inclusive. A *durable* ledger returns entries whose `debit.cost` is None:
+        # a CostEstimate is derived and is not a stored fact (§11 contract 1, ADR-0030 rule 1).
+        # `unpriced`, `pricing_hash` and the stored verdicts carry the pricing facts
     def declare_run(self, run_id: str) -> None: ...
         # a run exists once debited or declared (§13); idempotent; a blank id is refused.
         # PromptCadence declares at trajectory creation, so pre-flight never meets UnknownRun
@@ -132,16 +135,38 @@ InMemoryLedger(ceilings: Sequence[BudgetCeiling], *, clock: Clock)
 SqlLedger(session_factory, ceilings: Sequence[BudgetCeiling], *, clock: Clock,
           table_prefix: str = "ledger_")
 
-# loadledger.sql — mountable models (roadmap §2, D-6)
+# loadledger.sql — mountable models (roadmap §2, D-6). Lives under the `loadledger[sql]` extra and
+# is never imported from `loadledger/__init__.py`, so the pure core stays installable with nothing
+# but baseaicore (ADR-0050 decision 4).
+@dataclass(frozen=True, slots=True)
+class LedgerTables:
+    prefix: str                        # the prefix every table, index and constraint carries
+    entries: Table                     # one row per debit, with its verdicts
+    balances: Table                    # (scope, window_key) -> tokens + the three honesty counts
+    balance_money: Table               # (scope, window_key, currency) -> nanos
+    runs: Table                        # one row per declared or debited run
+    @property
+    def metadata(self) -> MetaData: ...             # the metadata the host passed in
+    @property
+    def all_tables(self) -> tuple[Table, ...]: ...  # the four above, in creation order
+
 def mount_ledger_tables(metadata: MetaData, *, prefix: str = "ledger_") -> LedgerTables: ...
 # plain-typed columns only; the application includes them in its own Alembic history and owns
 # the data. Two applications mounting these tables have two tables in two databases — never one.
+# The host holds the returned handle or discards it: the tables are already in the metadata it
+# passed, which is what autogenerate reads. A host that reaches in for a Table in order to *join*
+# it to one of its own entities is doing what ADR-0050 decision 2 forbids. Commissioner's
+# `mount_egress_tables` returns the same kind of object, with its own field names.
 
 # Errors (subclass baseaicore.SuiteError)
 LedgerError                LEDGER_ERROR
 ├── CurrencyMismatch       LEDGER_CURRENCY_MISMATCH   # ceiling USD, debit EUR — refused, not converted
 ├── InvalidCeiling         LEDGER_CEILING_INVALID     # incl. STRICT partial pricing with no money bound
-└── UnknownRun             LEDGER_UNKNOWN_RUN
+├── UnknownRun             LEDGER_UNKNOWN_RUN
+└── UnsupportedDialect     LEDGER_UNSUPPORTED_DIALECT # a session bound to anything but SQLite or
+                                                      # PostgreSQL (ADR-0006). Raised from
+                                                      # loadledger.sql only; the pure core never
+                                                      # sees a database
 ```
 
 ## 8. Inputs
@@ -159,11 +184,36 @@ None of its own. `loadledger.sql` defines the table shapes; the **application** 
 the rows and the retention (PromptCadence's `ledger_entries`, IdeaPress's when it adopts). The
 `InMemoryLedger` never survives the process and says so.
 
+`mount_ledger_tables` adds **four** tables, each under the host's chosen prefix (`ledger_` by
+default), and every table, index and primary-key constraint carries it:
+
+| Table | Key | Holds |
+|---|---|---|
+| `{prefix}entries` | `entry_id` (ULID) | the canonical debit record, `unpriced`, `pricing_hash`, and every verdict, whole. Ordered by `entry_id`, which is insertion order |
+| `{prefix}balances` | `(scope, window_key)` | `tokens_spent` and the three honesty counts |
+| `{prefix}balance_money` | `(scope, window_key, currency)` | `nanos_spent`. A currency with no row has had nothing priced in it, which is not zero (ADR-0016) |
+| `{prefix}runs` | `run_id` | `declared_at`, so a run declared with nothing debited survives a restart (§13) |
+
+Money is a table of its own rather than a column on the balance row because a balance's money is
+per currency and the currency set is open. A mapping in a JSON column could not be advanced by the
+single atomic `UPDATE … SET n = n + :delta` that keeps two concurrent debits from losing one
+another, and money is the half where losing one matters.
+
+Every column that accumulates — nanos, token counts, the honesty counts — is a **`BigInteger`**.
+`Money` is a whole number of nanos, so $2.15 is 2 150 000 000 and already past a 4-byte integer;
+PostgreSQL would raise on it and SQLite would not, so the width is part of the mounted contract
+rather than an implementation detail.
+
 ## 11. Public contracts
 
 1. **Store usage; derive cost** (ADR-0030 rule 1): an entry's primary facts are `TokenUsage` and
    `pricing_hash`; monetary balances are recomputable from entries and a price catalogue, and a
-   test proves re-costing history changes no stored row.
+   test proves re-costing history changes no stored row. A durable ledger therefore does not
+   persist the `CostEstimate` at all: `entries()` returns entries whose `debit.cost` is `None`,
+   whatever it was when the debit was recorded, with `unpriced`, `pricing_hash` and the stored
+   verdicts carrying the pricing facts. Nothing about what the ledger *decided* is lost — each
+   verdict is stored whole, with the money it was decided on — and this is the one place a
+   consumer swapping `InMemoryLedger` for `SqlLedger` sees a difference.
 2. **Unpriced is never zero, and a partial price is a floor**
    ([ADR-0069](../../adr/0069-a-partial-price-is-a-floor-and-a-money-ceiling-chooses-how-it-binds.md)):
    a debit with no estimate leaves every money balance untouched; a debit whose estimate did not
@@ -200,6 +250,8 @@ Constructor arguments only.
 | `STRICT` partial pricing on a ceiling with no money bound | `InvalidCeiling` — strictness is a statement about the money bound |
 | Debit currency ≠ ceiling currency | `CurrencyMismatch`, both named |
 | `remaining`/`would_exceed` for an unknown run | `UnknownRun` (a run exists once debited or declared) |
+| `mount_ledger_tables` with a prefix that is not a SQL identifier prefix | `ValueError`. Empty is refused too: it would mount a table called `entries` into the application's own schema |
+| A session bound to a dialect other than SQLite or PostgreSQL | `UnsupportedDialect`, naming the dialect — refused at the first statement rather than attempted and found as a syntax error inside a money transaction (ADR-0006) |
 | Debit exceeding a ceiling | **Not an error.** The entry records `exceeded=True` verdicts; refusing work is the caller's policy. `would_exceed` exists so the caller can refuse *before* spending |
 
 ## 14. Security considerations
@@ -213,9 +265,19 @@ id. No I/O beyond the caller-supplied session. Nothing here logs.
 |---|---|
 | `debit` with 3 active ceilings (`SqlLedger`, SQLite) | ≤ 5 ms |
 | `would_exceed` | ≤ 2 ms |
-| `entries` for a 10 000-entry run | ≤ 100 ms |
+| `entries` for a 10 000-entry run (`InMemoryLedger`) | ≤ 100 ms |
+| `entries` for a 10 000-entry run (`SqlLedger`, SQLite) — the query | ≤ 100 ms |
+| `entries` for a 10 000-entry run (`SqlLedger`, SQLite) — fully materialized | ≤ 250 ms |
 
 Balances are maintained incrementally per scope, not recomputed by summing all rows per debit.
+
+The last row is split because the two halves fail for different reasons and a single figure hid
+that. A durable `entries()` runs one indexed query and then constructs roughly thirty-five
+validated value objects per entry — a `Debit`, a `TokenUsage`, and one `CeilingVerdict`,
+`BudgetCeiling` and `Money` per active ceiling. The query is comfortably inside 100 ms; the
+materialization is not, and no indexing changes that. Splitting the row keeps the query's budget
+meaningful — a regression there means an N+1 query or a balance recomputed from history, and lands
+in seconds — while stating the real cost of turning ten thousand rows into value objects.
 
 ## 16. Cross-platform
 

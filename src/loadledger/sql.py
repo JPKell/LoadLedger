@@ -97,7 +97,7 @@ The canonical spelling is :meth:`baseaicore.TokenUsage.as_counts`'s, which is th
 
 @dataclass(frozen=True, slots=True)
 class LedgerTables:
-    """The four tables :func:`mount_ledger_tables` added to a host's metadata.
+    """The four tables :func:`mount_ledger_tables` added to a host's metadata (spec §7, §10).
 
     A handle, not a repository. The honest answer to "what does a host do with this?" is
     *hold it, or drop it on the floor*: the tables are already in the metadata the host passed,
@@ -166,7 +166,7 @@ def mount_ledger_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFI
     is the named failure mode of this pattern, and it is why the miniature-host test in this
     repository autogenerates rather than merely creating tables.
 
-    Why these four shapes:
+    Why these four shapes — the table set and its keys are normative, in spec §10:
 
     * **Columns are plain and portable** — ``VARCHAR``, ``TEXT``, ``BIGINT``, ``BOOLEAN`` and
       ``TIMESTAMP WITH TIME ZONE``, and nothing else. No ORM base with domain meaning, no
@@ -587,8 +587,9 @@ class SqlLedger:
 
         This is the input to a caller's own estimator and per-unit cost view (spec §6).
 
-        **The one place a stored entry differs from the one :meth:`debit` returned:**
-        ``entry.debit.cost`` is ``None``, whatever it was when the debit was recorded. A
+        **The one place a stored entry differs from the one :meth:`debit` returned** (spec §11
+        contract 1): ``entry.debit.cost`` is ``None``, whatever it was when the debit was
+        recorded. A
         :class:`~baseaicore.CostEstimate` is a derived figure, and ADR-0030 rule 1 says the stored
         facts are the ``TokenUsage`` and the ``pricing_hash`` — the money is re-derived from those
         whenever a price is corrected, which is the whole reason re-costing history is possible.

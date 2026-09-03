@@ -51,7 +51,7 @@ packaging and release standards §3.
     `metadata` and `all_tables`.
   - `UnsupportedDialect` (`LEDGER_UNSUPPORTED_DIALECT`): ADR-0006 admits SQLite and PostgreSQL, and
     a third dialect is refused at the first statement rather than found as a syntax error inside a
-    money transaction. Beyond spec §7's error table; amendment proposed in `C3_HANDOFF.md`.
+    money transaction. Now in spec §7's error list and §13's table.
   - `loadledger.core` gains the seams a durable ledger needs, all documented: `DebitContribution`,
     `contribution_of`, `BalanceBook.windows_touched` / `window_for` / `seed`, `resolved_debit` and
     `is_unpriced`. The package's top-level `__all__` is unchanged.
@@ -71,9 +71,22 @@ packaging and release standards §3.
   spelling is kept, because a forbidden module that no longer exists forbids nothing.
 - `pytest` `addopts` gains `-ra`, so a skipped PostgreSQL leg always names itself in the summary.
 
-### Known limitation
-- `entries()` for a 10 000-entry run materializes in ~155 ms against spec §15's 100 ms. The query
-  itself takes ~17 ms; the overshoot is constructing ten thousand validated value objects, and no
-  indexing changes it. A split of that §15 row — query ≤ 100 ms, full materialization ≤ 250 ms — is
-  proposed in `C3_HANDOFF.md`. `debit` (~1.5 ms against 5 ms) and `would_exceed` (~0.4 ms against
-  2 ms) are inside budget, and `debit` does not slow down as history grows.
+### Specification
+- Spec §7, §10, §11, §13 and §15 were amended to describe what Phase 2 built, and the amendments
+  were accepted before release:
+  - §7 gains `LedgerTables`'s field list and `UnsupportedDialect`, and states what a durable
+    ledger's `entries()` returns.
+  - §10 names the four mounted tables and their keys, says why money is a table rather than a
+    column, and makes the `BigInteger` width part of the mounted contract.
+  - §11 contract 1 states that a durable ledger does not persist the `CostEstimate` — the one
+    place a consumer swapping `InMemoryLedger` for `SqlLedger` sees a difference.
+  - §13 gains rows for the prefix `ValueError` and for `UnsupportedDialect`.
+  - §15's single `entries` budget is split: for `SqlLedger` on SQLite, the query is ≤ 100 ms and
+    full materialization ≤ 250 ms. `InMemoryLedger` keeps ≤ 100 ms. The old single figure was set
+    before `SqlLedger` existed and was never about constructing ten thousand value objects.
+
+### Performance, as measured
+- `debit` with three ceilings ~1.5 ms (budget 5 ms) and flat as history grows — balances are
+  maintained, not recomputed. `would_exceed` ~0.4 ms (budget 2 ms). `entries` over a 10 000-entry
+  run: ~17 ms for the query (budget 100 ms), ~155 ms fully materialized (budget 250 ms). All
+  inside the amended §15.

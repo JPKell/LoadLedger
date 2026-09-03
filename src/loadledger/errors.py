@@ -76,8 +76,9 @@ class UnsupportedDialect(LedgerError):
 
     The suite runs on exactly two dialects — SQLite and PostgreSQL, both first-class
     (:doc:`ADR-0006 <adr>`) — and :class:`~loadledger.sql.SqlLedger`'s balance upsert is written
-    for both. A third dialect is refused at the first statement rather than discovered as a syntax
-    error partway through a money transaction. ``details`` names the dialect that was bound.
+    for both (spec §7's error list, §13's last row). A third dialect is refused at the first
+    statement rather than discovered as a syntax error partway through a money transaction.
+    ``details`` names the dialect that was bound.
 
     Raised only from ``loadledger.sql``; the pure core never sees a database.
     """
