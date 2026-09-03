@@ -12,6 +12,9 @@ forbidden_modules =
     ideapress
     promptcadence
 
+# `commissioner` was called `spotcheck` until py/Commissioner's rename (7077cc4). Both spellings
+# are listed: a forbidden module that no longer exists forbids nothing, silently, so dropping the
+# old name would quietly stop guarding against an import written before the rename.
 [importlinter:contract:no-sibling-packages]
 name = LoadLedger must not import sibling capability packages
 type = forbidden
@@ -24,15 +27,25 @@ forbidden_modules =
     mirrorwall
     cutctx
     toolyard
+    commissioner
     spotcheck
 
-[importlinter:contract:no-sql-in-phase-1]
-# ADR-0050 §4: `sqlalchemy` is an optional extra so the pure-value core stays installable with
-# nothing but baseaicore. Until Phase 2 adds `loadledger.sql`, no module here may import it, and
-# after Phase 2 this contract is replaced by one that exempts `loadledger.sql` alone.
-name = LoadLedger must not import sqlalchemy before Phase 2
+# Replaces `no-sql-in-phase-1`, which forbade `sqlalchemy` outright while `loadledger.sql` did not
+# exist. Same rule, with the one exemption Phase 2 earned, and it is the mechanical statement of
+# ADR-0050 decision 4: `sqlalchemy` is an optional extra (`loadledger[sql]`) so the pure-value core
+# stays installable with nothing but baseaicore. Weakening this contract — or deleting it, which
+# looks identical in a diff — makes `pip install loadledger` drag an ORM into every consumer that
+# only wanted to add up tokens.
+#
+# `alembic` has no exemption at all: the host owns every migration (ADR-0050 decision 5), so no
+# module in this package imports it, `loadledger.sql` included. It is a test dependency for the
+# miniature host and never a runtime one.
+[importlinter:contract:only-the-sql-module-imports-sqlalchemy]
+name = Only loadledger.sql may import SQLAlchemy, and nothing may import Alembic
 type = forbidden
 source_modules = loadledger
 forbidden_modules =
     sqlalchemy
     alembic
+ignore_imports =
+    loadledger.sql -> sqlalchemy

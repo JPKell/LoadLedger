@@ -69,6 +69,37 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -m "not live and not performance"
 
+  db-matrix:
+    name: tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        # Credentials and database name match `DEFAULT_POSTGRES_URL` in tests/conftest.py, so the
+        # service this job starts is the one the integration tests look for.
+        env:
+          POSTGRES_USER: loadledger
+          POSTGRES_PASSWORD: loadledger
+          POSTGRES_DB: loadledger_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U loadledger -d loadledger_test" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install --require-hashes -r requirements/ci.lock
+      - run: pip install . --no-deps
+      - run: pytest -m "not live and not performance" tests/integration
+        env:
+          # Without this the PostgreSQL legs would *skip* here exactly as they do on a developer's
+          # machine, and the job would go green having tested one dialect twice. A skipped dialect
+          # is an untested dialect.
+          LOADLEDGER_REQUIRE_POSTGRES: "1"
+          # The tests read LOADLEDGER_POSTGRES_URL, not DATABASE_URL. Set explicitly rather than
+          # relying on the default, so the job states which server it is testing.
+          LOADLEDGER_POSTGRES_URL: postgresql+psycopg://loadledger:loadledger@localhost:5432/loadledger_test
+
   coverage:
     needs: [tests]
     runs-on: ubuntu-latest

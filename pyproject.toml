@@ -28,9 +28,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# No `sql` extra yet. `loadledger.sql` and `SqlLedger` arrive in Phase 2 (development plan);
-# declaring the extra ahead of the module would advertise an import that does not exist.
+# `loadledger.sql` only. The core stays installable with nothing but `baseaicore` (gold standards
+# §2: this package's non-suite runtime dependency budget is 0) — a consumer that only wants to add
+# up tokens must not acquire an ORM to do it (ADR-0050 decision 4). `alembic` is deliberately NOT
+# here: the host owns every migration, so nothing in this package imports it at runtime.
+sql = [
+    "sqlalchemy>=2,<3",
+]
 dev = [
+    # The `sql` extra's dependency, plus the two things only its *tests* need. `alembic` drives the
+    # miniature host in `tests/integration/hostapp/` — a real Alembic project, because ADR-0050
+    # decision 6 says the mounting pattern is only as good as the evidence that a host's migration
+    # story survives it. The PostgreSQL driver is needed to build a `postgresql://` engine at all;
+    # the tests that use it skip when no server is reachable, and CI's `db-matrix` job supplies one.
+    "sqlalchemy>=2,<3",
+    "alembic>=1.13,<2",
+    "psycopg[binary]>=3.2,<4",
     # >=9.0.3 excludes PYSEC-2026-1845 (vulnerable /tmp/pytest-of-{user} handling,
     # affecting pytest through 9.0.2). Matches the pin BaseAiCore, SetSpec, ModelRack,
     # SweatMeter, WeightsDB and MirrorWall already moved to.
@@ -56,7 +69,7 @@ packages = ["src/loadledger"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "tests/integration"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S", "T20", "DTZ", "PTH", "D1", "BLE"]
@@ -74,7 +87,7 @@ strict = true
 warn_unused_configs = true
 
 [tool.pytest.ini_options]
-addopts = "-m 'not live and not performance'"
+addopts = "-ra -m 'not live and not performance'"
 markers = [
     "live: requires a real provider/GPU, never in default CI",
     "performance: performance budget assertions, excluded by default",
