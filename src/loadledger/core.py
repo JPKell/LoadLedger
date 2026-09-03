@@ -44,14 +44,24 @@ from loadledger.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     from baseaicore import CostEstimate
 
-__all__ = ["BalanceBook", "Ledger", "utc_day_key", "utc_day_start"]
+__all__ = [
+    "BalanceBook",
+    "DebitContribution",
+    "Ledger",
+    "ScopeKey",
+    "contribution_of",
+    "is_unpriced",
+    "resolved_debit",
+    "utc_day_key",
+    "utc_day_start",
+]
 
-type _ScopeKey = tuple[CeilingScope, str]
+type ScopeKey = tuple[CeilingScope, str]
 """What a balance is filed under: the scope and the value that identifies its window."""
 
 
@@ -97,8 +107,54 @@ def utc_day_key(when: datetime) -> str:
     return utc_day_start(when).strftime("%Y-%m-%d")
 
 
+def resolved_debit(debit: Debit, occurred_at: datetime) -> Debit:
+    """Return ``debit`` with its instant resolved, or itself when it already carries one.
+
+    Every ledger stores a debit whose ``occurred_at`` is a real instant, never ``None``: the
+    canonical form refuses an unresolved one, and a persisted row has to say which UTC day it
+    landed in. Resolution happens once, from the ledger's injected clock, at the moment of
+    recording.
+
+    ``dataclasses.replace`` is avoided deliberately: it re-runs ``__post_init__``, which is what
+    we want, but it also reconstructs a slotted frozen dataclass field by field, and doing it
+    explicitly here keeps the resolved shape visible at the one place it is created.
+
+    Args:
+        debit: The debit as the caller built it.
+        occurred_at: The instant to use when the debit does not carry one.
+
+    Returns:
+        The same object when ``debit.occurred_at`` is already set, so a caller's back-dated
+        instant is never overwritten; otherwise a copy carrying ``occurred_at``.
+    """
+    if debit.occurred_at is not None:
+        return debit
+    return type(debit)(
+        run_id=debit.run_id,
+        source_ref=debit.source_ref,
+        usage=debit.usage,
+        cost=debit.cost,
+        tags=debit.tags,
+        occurred_at=occurred_at,
+    )
+
+
+def is_unpriced(cost: CostEstimate | None) -> bool:
+    """Report whether a cost is absent or could not be totalled (spec §7's ``unpriced``).
+
+    Args:
+        cost: The estimate, or ``None`` when no pricing was applied at all.
+
+    Returns:
+        ``True`` in both of the cases that make an entry's money incomplete — no estimate, and an
+        estimate whose ``total`` is :data:`~baseaicore.UNSUPPORTED`. The two are distinguished by
+        the verdict's ``untotalled_debit_count``, not here.
+    """
+    return cost is None or not is_supported(cost.total)
+
+
 @dataclass(frozen=True, slots=True)
-class _Contribution:
+class DebitContribution:
     """What one debit adds to every scope balance it touches.
 
     Computed once per debit and applied to each scope, so the honesty rules are decided in one
@@ -131,7 +187,7 @@ class _Contribution:
     unmetered: bool
 
 
-_NOTHING = _Contribution(
+_NOTHING = DebitContribution(
     tokens=0,
     currency=None,
     nanos=0,
@@ -143,7 +199,7 @@ _NOTHING = _Contribution(
 """The contribution of no prospective debit at all — used by ``would_exceed`` with no usage."""
 
 
-def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribution:
+def contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> DebitContribution:
     """Reduce a debit's usage and cost to what it adds to a balance (ADR-0069).
 
     Args:
@@ -168,7 +224,7 @@ def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribut
         else:
             unmetered = True
     if cost is None:
-        return _Contribution(
+        return DebitContribution(
             tokens=tokens,
             currency=None,
             nanos=0,
@@ -189,7 +245,7 @@ def _contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> _Contribut
             nanos += component.nanos
             priced = True
     totalled = is_supported(cost.total)
-    return _Contribution(
+    return DebitContribution(
         tokens=tokens,
         currency=cost.currency,
         nanos=nanos,
@@ -243,7 +299,7 @@ class BalanceBook:
                 verdicts with the configuration that produced them positionally.
         """
         self._ceilings: tuple[BudgetCeiling, ...] = tuple(ceilings)
-        self._balances: dict[_ScopeKey, _ScopeBalance] = {}
+        self._balances: dict[ScopeKey, _ScopeBalance] = {}
 
     @property
     def ceilings(self) -> tuple[BudgetCeiling, ...]:
@@ -264,8 +320,8 @@ class BalanceBook:
             occurred_at: The resolved instant the debit happened at, which decides the UTC day
                 its ``PER_DAY`` balance lands in.
         """
-        contribution = _contribution_of(debit.usage, debit.cost)
-        for key in self._keys_touched(debit.run_id, occurred_at, debit.tags):
+        contribution = contribution_of(debit.usage, debit.cost)
+        for key in self.windows_touched(debit.run_id, occurred_at, debit.tags):
             balance = self._balances.get(key)
             if balance is None:
                 balance = _ScopeBalance()
@@ -314,11 +370,11 @@ class BalanceBook:
         """
         if cost is None:
             return
-        touched = self._keys_touched(run_id, at, tags)
+        touched = self.windows_touched(run_id, at, tags)
         for ceiling in self._ceilings:
             if ceiling.money is None:
                 continue
-            if self._key_for(ceiling, run_id=run_id, at=at) not in touched:
+            if self.window_for(ceiling, run_id=run_id, at=at) not in touched:
                 continue
             if ceiling.money.currency != cost.currency:
                 raise CurrencyMismatch(
@@ -365,11 +421,11 @@ class BalanceBook:
             caller takes any ``exceeded`` verdict as binding, and every verdict names the cap and
             the numbers it fired on.
         """
-        prospective: _Contribution | None = None
-        touched: frozenset[_ScopeKey] = frozenset()
+        prospective: DebitContribution | None = None
+        touched: frozenset[ScopeKey] = frozenset()
         if usage is not None or cost is not None:
-            prospective = _contribution_of(usage if usage is not None else TokenUsage(), cost)
-            touched = self._keys_touched(run_id, at, tags)
+            prospective = contribution_of(usage if usage is not None else TokenUsage(), cost)
+            touched = self.windows_touched(run_id, at, tags)
         return tuple(
             self._verdict_for(
                 ceiling,
@@ -387,11 +443,11 @@ class BalanceBook:
         *,
         run_id: str,
         at: datetime,
-        touched: frozenset[_ScopeKey],
-        prospective: _Contribution | None,
+        touched: frozenset[ScopeKey],
+        prospective: DebitContribution | None,
     ) -> CeilingVerdict:
         """Build one ceiling's verdict from its window's balance plus any prospective debit."""
-        key = self._key_for(ceiling, run_id=run_id, at=at)
+        key = self.window_for(ceiling, run_id=run_id, at=at)
         balance = self._balances.get(key, _EMPTY_BALANCE)
         applies = prospective is not None and key in touched
         delta = prospective if applies and prospective is not None else _NOTHING
@@ -441,11 +497,25 @@ class BalanceBook:
             unmetered_debit_count=balance.unmetered_debit_count + (1 if delta.unmetered else 0),
         )
 
-    def _keys_touched(
-        self, run_id: str, at: datetime, tags: tuple[str, ...]
-    ) -> frozenset[_ScopeKey]:
-        """Return every scope window a debit with these coordinates falls into."""
-        keys: set[_ScopeKey] = {
+    @staticmethod
+    def windows_touched(run_id: str, at: datetime, tags: tuple[str, ...]) -> frozenset[ScopeKey]:
+        """Return every scope window a debit with these coordinates falls into.
+
+        Independent of the configured ceilings, deliberately: a debit is recorded into every
+        window it belongs to whether or not a ceiling reads that window today, so a ceiling added
+        later binds on the full history rather than on the history since it was configured. A
+        durable ledger persists exactly these keys.
+
+        Args:
+            run_id: The run the debit belongs to.
+            at: The resolved instant the debit happened at, deciding its UTC day.
+            tags: The debit's tags, each of which is a window of its own.
+
+        Returns:
+            Every ``(scope, window_key)`` the debit accumulates into — always its run and its UTC
+            day, plus one per tag.
+        """
+        keys: set[ScopeKey] = {
             (CeilingScope.PER_RUN, run_id),
             (CeilingScope.PER_DAY, utc_day_key(at)),
         }
@@ -453,14 +523,69 @@ class BalanceBook:
         return frozenset(keys)
 
     @staticmethod
-    def _key_for(ceiling: BudgetCeiling, *, run_id: str, at: datetime) -> _ScopeKey:
-        """Return the window key one ceiling reads, for this run at this instant."""
+    def window_for(ceiling: BudgetCeiling, *, run_id: str, at: datetime) -> ScopeKey:
+        """Return the window key one ceiling reads, for this run at this instant.
+
+        The inverse of :meth:`windows_touched`: that method says where a debit is *written*, this
+        one says where a ceiling *reads*. A durable ledger loads exactly these keys before
+        evaluating, and creates none of them — a ceiling reading an empty window must not bring
+        the window into existence (spec contract 6).
+
+        Args:
+            ceiling: The ceiling to locate.
+            run_id: The run being reported on, used only by a ``PER_RUN`` ceiling.
+            at: The instant to resolve a ``PER_DAY`` ceiling's window at.
+
+        Returns:
+            The single ``(scope, window_key)`` this ceiling's balance lives under.
+        """
         if ceiling.scope is CeilingScope.PER_RUN:
             return (CeilingScope.PER_RUN, run_id)
         if ceiling.scope is CeilingScope.PER_DAY:
             return (CeilingScope.PER_DAY, utc_day_key(at))
         # PER_TAG: the tag is non-None by BudgetCeiling's own validation.
         return (CeilingScope.PER_TAG, ceiling.tag or "")
+
+    def seed(
+        self,
+        key: ScopeKey,
+        *,
+        tokens_spent: int,
+        nanos_by_currency: Mapping[str, int],
+        unpriced_debit_count: int,
+        untotalled_debit_count: int,
+        unmetered_debit_count: int,
+    ) -> None:
+        """Install one window's already-accumulated balance, as read out of durable storage.
+
+        The seam a persistent ledger evaluates through. :class:`~loadledger.sql.SqlLedger` keeps
+        the balances in its host's database rather than in this book, loads the windows its
+        ceilings read, seeds them here, and calls :meth:`verdicts` — so the arithmetic and the
+        honesty rules have exactly one implementation for both storage backends.
+
+        Nothing is validated beyond the types: the caller is handing back numbers this package's
+        own :meth:`record` produced. Seeding the same key twice **replaces** rather than adds, so
+        a book seeded from a query is a snapshot of the store and never double-counts.
+
+        Args:
+            key: The ``(scope, window_key)`` this balance belongs to, as
+                :meth:`windows_touched` or :meth:`window_for` spells it.
+            tokens_spent: Tokens accumulated in this window, over the classes providers reported.
+            nanos_by_currency: Nanos accumulated per currency. A currency absent from the mapping
+                has had nothing priced in it, which reads differently from zero (ADR-0016) —
+                so a store must omit the key rather than write a zero.
+            unpriced_debit_count: Debits here that added less than their full cost.
+            untotalled_debit_count: The subset of those that carried an estimate which did not
+                total.
+            unmetered_debit_count: Debits here that left at least one token class unreported.
+        """
+        self._balances[key] = _ScopeBalance(
+            tokens_spent=tokens_spent,
+            nanos_by_currency=dict(nanos_by_currency),
+            unpriced_debit_count=unpriced_debit_count,
+            untotalled_debit_count=untotalled_debit_count,
+            unmetered_debit_count=unmetered_debit_count,
+        )
 
 
 @runtime_checkable

@@ -15,9 +15,9 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
-from baseaicore import UlidGenerator, is_supported
+from baseaicore import UlidGenerator
 
-from loadledger.core import BalanceBook
+from loadledger.core import BalanceBook, is_unpriced, resolved_debit
 from loadledger.errors import UnknownRun
 from loadledger.types import LedgerEntry
 
@@ -111,9 +111,7 @@ class InMemoryLedger:
         """
         with self._lock:
             occurred_at = debit.occurred_at if debit.occurred_at is not None else self._clock()
-            resolved = (
-                debit if debit.occurred_at is not None else _with_occurred_at(debit, occurred_at)
-            )
+            resolved = resolved_debit(debit, occurred_at)
             self._book.require_currency_compatible(
                 resolved.cost, run_id=resolved.run_id, at=occurred_at, tags=resolved.tags
             )
@@ -122,7 +120,7 @@ class InMemoryLedger:
             entry = LedgerEntry(
                 entry_id=self._ids.new_id(),
                 debit=resolved,
-                unpriced=_is_unpriced(resolved.cost),
+                unpriced=is_unpriced(resolved.cost),
                 pricing_hash=resolved.cost.pricing_hash if resolved.cost is not None else None,
                 verdicts=self._book.verdicts(run_id=resolved.run_id, at=occurred_at),
             )
@@ -236,28 +234,6 @@ class InMemoryLedger:
                 "would look exactly like reporting one for a run that has spent nothing.",
                 details={"run_id": run_id},
             )
-
-
-def _with_occurred_at(debit: Debit, occurred_at: datetime) -> Debit:
-    """Return a copy of ``debit`` with its instant resolved.
-
-    ``dataclasses.replace`` is avoided deliberately: it re-runs ``__post_init__``, which is what
-    we want, but it also has to reconstruct a slotted frozen dataclass field by field, and doing
-    it explicitly here keeps the resolved shape visible at the one place it is created.
-    """
-    return type(debit)(
-        run_id=debit.run_id,
-        source_ref=debit.source_ref,
-        usage=debit.usage,
-        cost=debit.cost,
-        tags=debit.tags,
-        occurred_at=occurred_at,
-    )
-
-
-def _is_unpriced(cost: CostEstimate | None) -> bool:
-    """Report whether a cost is absent or could not be totalled (spec §7's ``unpriced``)."""
-    return cost is None or not is_supported(cost.total)
 
 
 def _at(entry: LedgerEntry) -> datetime:
