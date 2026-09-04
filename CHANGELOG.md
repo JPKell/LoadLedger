@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 [Semantic Versioning](https://semver.org/), pre-1.0 per
 packaging and release standards §3.
 
-## [Unreleased]
+## [0.2.0] — 2026-09-04
 
 ### Added
 - `Ledger.balances(*, scope, window_key)` on the protocol, `InMemoryLedger` and `SqlLedger`, with
