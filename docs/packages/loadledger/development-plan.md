@@ -105,3 +105,52 @@ without the prefix.
 **Gold standards:** application-owned data; one transaction per debit; both dialects green.
 **Deferred:** IdeaPress adoption (roadmap §6); price-catalogue helper (ADR-0030's own trigger);
 soft ceilings.
+
+---
+
+## Phase 3 — A balance read that names no run — publish 0.2.0
+
+**Goal:** a caller can ask what one window has accumulated without naming a run or inventing a
+ceiling to read it through.
+
+**Prerequisites:** Phase 2; PromptCadence Phase 5 as built (row F1), which is where the gap was
+found.
+
+**Work**
+* `balances(*, scope, window_key)` on the `Ledger` protocol, `InMemoryLedger` and `SqlLedger`,
+  returning the accumulated tokens, the per-currency money and the three honesty counts for one
+  window — **no `run_id`, no ceiling**. The arithmetic already exists: `BalanceBook` maintains
+  exactly this record per `(scope, window_key)`, and `{prefix}balances` /
+  `{prefix}balance_money` are keyed on it, so this is a read of state the package already holds.
+* The counts ride on it. A balance returned without `unpriced_debit_count` is a floor presenting
+  itself as a total, which spec contract 2 forbids; the whole point of the read is to answer a
+  *view*, and a view that cannot say "at least" is the failure ADR-0069 exists to prevent.
+* Both implementations evaluate through the one `BalanceBook`, as every other method does, so the
+  in-memory double keeps answering what production answers.
+* Optionally `window_keys(scope)`, so a caller can ask which tags have spent anything without
+  reading every entry — include it if it is cheap on both dialects, leave it out if it is not.
+
+**Why this exists.** Spec §7's surface answers "may this run spend" and "what has this run spent".
+It cannot answer "what has been spent in this window", which is what a dashboard asks and what
+PromptCadence needed for its per-tier and per-day views (`F1_HANDOFF.md` §7). The two ways to
+answer it from outside are summing `entries()` in the application — ledger arithmetic in a
+consumer, which is what ADR-0050's mount exists to prevent — or configuring a ceiling nobody
+intends to enforce purely to read a number through, which puts a fabricated cap in the record.
+
+**Tests**
+* A window with no ceiling configured still reports its balance, on both implementations and both
+  dialects.
+* The three honesty counts match what a `CeilingVerdict` over the same window reports, so the two
+  reads cannot disagree.
+* An unknown `window_key` reports zero tokens and `money=None` — nothing spent is not the same as
+  no money spent (ADR-0016), and neither is an error.
+* A `per_day` key resolved through `utc_day_key` matches what a debit at that instant landed in.
+
+**Acceptance criteria**
+1. `promptcadence ledger show --scope tier` reports spend rather than debit counts, with no
+   arithmetic in PromptCadence and no ceiling invented to read it through.
+
+**Not in this phase:** a tier ceiling. PromptCadence configures none by design (its lifecycle §6);
+this is a **view**, not a cap.
+**Gold standards:** integer-exact, no float, no recomputation from history.
+
