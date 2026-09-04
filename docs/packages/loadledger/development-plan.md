@@ -127,8 +127,18 @@ found.
   *view*, and a view that cannot say "at least" is the failure ADR-0069 exists to prevent.
 * Both implementations evaluate through the one `BalanceBook`, as every other method does, so the
   in-memory double keeps answering what production answers.
-* Optionally `window_keys(scope)`, so a caller can ask which tags have spent anything without
-  reading every entry — include it if it is cheap on both dialects, leave it out if it is not.
+* `position()` on the same three, alongside it: `remaining` for **no particular run** — every
+  configured ceiling, `PER_DAY` resolved at the injected clock's UTC day, refusing a `PER_RUN`
+  ceiling with `InvalidCeiling` because such a cap has no window without a run. Mechanically it is
+  `BalanceBook.verdicts` minus its `run_id` and `SqlLedger._windows_read` minus the `PER_RUN` key:
+  the same engine, the same honesty counts, no new storage. `balances()` alone does not close the
+  gap `F1_HANDOFF.md` §7 names — it fixes `--scope tier`, but `--scope day` and `--scope project`
+  need **headroom against a configured ceiling**, and deriving that outside the package would put
+  the floor rule and the `exceeded` decision in a consumer. Without this method the reference-run
+  workaround survives.
+* `window_keys(scope)` is **not** included. It is cheap on both backends, but the consumer this
+  phase exists for knows its tier names from `[tiers.<name>]` configuration and never asks — and an
+  unused public method in a 0.x package is surface that then has to be kept and versioned.
 
 **Why this exists.** Spec §7's surface answers "may this run spend" and "what has this run spent".
 It cannot answer "what has been spent in this window", which is what a dashboard asks and what
@@ -142,8 +152,14 @@ intends to enforce purely to read a number through, which puts a fabricated cap 
   dialects.
 * The three honesty counts match what a `CeilingVerdict` over the same window reports, so the two
   reads cannot disagree.
-* An unknown `window_key` reports zero tokens and `money=None` — nothing spent is not the same as
-  no money spent (ADR-0016), and neither is an error.
+* An unknown `window_key` reports zero tokens and **no money at all** — nothing spent is not the
+  same as no money spent (ADR-0016), and neither is an error. Money is per currency and the
+  currency set is open, so the field is a tuple of the currencies something was priced in
+  (ascending by code, never summed across them — ADR-0030 rule 3) and an empty tuple is the
+  "nothing priced" answer a single `money=None` would otherwise have carried.
+* `position()` answers exactly what `remaining()` answers for the same ledger-wide ceilings, on
+  both implementations; it refuses a `PER_RUN` ceiling; and on an empty ledger it reports the caps
+  with nothing spent, which is reached as a fact rather than as an `UnknownRun` fallback.
 * A `per_day` key resolved through `utc_day_key` matches what a debit at that instant landed in.
 
 **Acceptance criteria**

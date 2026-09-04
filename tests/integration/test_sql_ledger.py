@@ -24,9 +24,11 @@ from loadledger import (
     CurrencyMismatch,
     Debit,
     InMemoryLedger,
+    InvalidCeiling,
     PartialPricing,
     UnknownRun,
     UnsupportedDialect,
+    utc_day_key,
 )
 from loadledger.sql import SqlLedger
 
@@ -531,3 +533,161 @@ def test_a_third_dialect_is_refused_rather_than_attempted() -> None:
         durable.declare_run("traj-1")
     assert raised.value.details["dialect"] == "mysql"
     assert raised.value.code == "LEDGER_UNSUPPORTED_DIALECT"
+
+
+# -- the run-free reads (Phase 3) ---------------------------------------------------------------
+
+
+def ledger_wide_ceilings() -> list[BudgetCeiling]:
+    """`ceilings()` without its per-run cap — what a dashboard's ledger is built over."""
+    return [ceiling for ceiling in ceilings() if ceiling.scope is not CeilingScope.PER_RUN]
+
+
+@pytest.mark.contract
+def test_balances_and_position_answer_what_the_in_memory_ledger_answers(engine: Engine) -> None:
+    memory_clock, sql_clock = ManualClock(), ManualClock()
+    memory = InMemoryLedger(ledger_wide_ceilings(), clock=memory_clock)
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), ledger_wide_ceilings(), clock=sql_clock)
+    for one in script(memory_clock):
+        memory.debit(one)
+    for one in script(sql_clock):
+        durable.debit(one)
+
+    for scope, key in (
+        (CeilingScope.PER_TAG, "tier:local_fast"),
+        (CeilingScope.PER_TAG, "tier:remote_slow"),
+        (CeilingScope.PER_DAY, utc_day_key(MIDDAY)),
+        (CeilingScope.PER_DAY, utc_day_key(MIDDAY - DAY)),
+        (CeilingScope.PER_RUN, "traj-1"),
+    ):
+        assert (
+            memory.balances(scope=scope, window_key=key).as_canonical()
+            == durable.balances(scope=scope, window_key=key).as_canonical()
+        )
+    assert [verdict.as_canonical() for verdict in memory.position()] == [
+        verdict.as_canonical() for verdict in durable.position()
+    ]
+
+
+def test_a_tier_with_no_ceiling_over_it_still_reports_its_spend(engine: Engine) -> None:
+    # The row's reason for existing: no ceiling names `tier:remote_slow`, and it has spend.
+    clock = ManualClock()
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), (), clock=clock)
+    for one in script(clock):
+        durable.debit(one)
+
+    balance = durable.balances(scope=CeilingScope.PER_TAG, window_key="tier:remote_slow")
+
+    assert balance.tokens_spent == 175_500
+    # Two priced debits, one of which did not total — so the figure is a floor and says so.
+    assert balance.money_spent == (Money.from_decimal("USD", "0.5925"),)
+    assert (balance.unpriced_debit_count, balance.untotalled_debit_count) == (1, 1)
+
+
+def test_the_counts_a_balance_reports_equal_the_counts_the_verdict_reports(
+    engine: Engine,
+) -> None:
+    clock = ManualClock()
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), ceilings(), clock=clock)
+    for one in script(clock):
+        durable.debit(one)
+
+    balance = durable.balances(scope=CeilingScope.PER_TAG, window_key="tier:local_fast")
+    verdict = durable.remaining("traj-1")[2]
+
+    assert verdict.ceiling.tag == "tier:local_fast"
+    assert balance.tokens_spent == verdict.tokens_spent
+    assert (
+        balance.unpriced_debit_count,
+        balance.untotalled_debit_count,
+        balance.unmetered_debit_count,
+    ) == (
+        verdict.unpriced_debit_count,
+        verdict.untotalled_debit_count,
+        verdict.unmetered_debit_count,
+    )
+
+
+def test_an_unknown_window_reports_nothing_spent_and_creates_no_row(engine: Engine) -> None:
+    # Contract 6's shape, and the easy one to break: a window a read asks about must not be
+    # brought into existence as a zero, which would claim something was spent and priced at
+    # nothing (ADR-0016).
+    clock = ManualClock()
+    _, tables = mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), ledger_wide_ceilings(), clock=clock)
+    durable.debit(script(clock)[0])
+    before = snapshot(engine, tables)
+
+    balance = durable.balances(scope=CeilingScope.PER_TAG, window_key="tier:never_used")
+    for _ in range(20):
+        durable.position()
+
+    assert balance.tokens_spent == 0
+    assert balance.money_spent == ()
+    assert snapshot(engine, tables) == before
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_balances_refuses_a_blank_window_key(engine: Engine, blank: str) -> None:
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), (), clock=ManualClock())
+    with pytest.raises(ValueError, match="non-blank"):
+        durable.balances(scope=CeilingScope.PER_TAG, window_key=blank)
+
+
+def test_position_refuses_a_per_run_ceiling_rather_than_omitting_it(engine: Engine) -> None:
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), ceilings(), clock=ManualClock())
+    with pytest.raises(InvalidCeiling) as raised:
+        durable.position()
+    assert raised.value.details["scope"] == "per_run"
+    assert raised.value.code == "LEDGER_CEILING_INVALID"
+
+
+def test_a_position_on_an_empty_ledger_is_nothing_spent_and_not_a_fallback(
+    engine: Engine,
+) -> None:
+    # No run exists, so `remaining` could only raise UnknownRun; this answers the caps with
+    # nothing spent, which is what is true.
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), ledger_wide_ceilings(), clock=ManualClock())
+
+    position = durable.position()
+
+    assert [verdict.tokens_spent for verdict in position] == [0, 0]
+    assert position[0].money_spent is None
+    assert position[0].money_remaining == Money.from_decimal("USD", "25.00")
+
+
+def test_a_mixed_currency_window_reports_both_currencies_from_two_rows(engine: Engine) -> None:
+    # No money ceiling covers this tag, so nothing is refused and both currencies land — in two
+    # rows of `{prefix}balance_money`, which is why money is a table of its own (spec §10).
+    clock = ManualClock()
+    mounted(engine)
+    durable = SqlLedger(session_factory_for(engine), (), clock=clock)
+    # Every token class stated, so each estimate totals and neither figure is a floor.
+    usage = TokenUsage(
+        input_tokens=1_000, output_tokens=100, cache_write_tokens=0, cache_read_tokens=0
+    )
+    for index, currency in enumerate(("USD", "EUR")):
+        durable.debit(
+            Debit(
+                run_id="traj-1",
+                source_ref=f"turn-{index}",
+                usage=usage,
+                cost=cost_of(usage, price=pricing(rates(currency))),
+                tags=("tier:mixed",),
+                occurred_at=MIDDAY,
+            )
+        )
+
+    balance = durable.balances(scope=CeilingScope.PER_TAG, window_key="tier:mixed")
+
+    assert balance.money_spent == (
+        Money.from_decimal("EUR", "0.0045"),
+        Money.from_decimal("USD", "0.0045"),
+    )
+    assert balance.unpriced_debit_count == 0

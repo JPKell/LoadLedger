@@ -109,6 +109,18 @@ class CeilingVerdict:
     unmetered_debit_count: int = 0     # left at least one token class unreported
 
 @dataclass(frozen=True, slots=True)
+class WindowBalance:                   # what one window holds, with no ceiling read through it
+    scope: CeilingScope
+    window_key: str                    # run_id / UTC day key / tag, as the balance is filed
+    tokens_spent: int = 0
+    money_spent: tuple[Money, ...] = ()    # one per currency, ascending by code, never summed
+                                       # across them (ADR-0030 rule 3). Empty ⇒ nothing priced
+                                       # here at all; an absent currency is not a zero (ADR-0016)
+    unpriced_debit_count: int = 0      # the same three counts a verdict carries, and for the same
+    untotalled_debit_count: int = 0    # reason: a balance handed over without them is a floor
+    unmetered_debit_count: int = 0     # presenting itself as a total (contract 2)
+
+@dataclass(frozen=True, slots=True)
 class LedgerEntry:
     entry_id: str
     debit: Debit
@@ -122,6 +134,17 @@ class Ledger(Protocol):
                      cost: CostEstimate | None = None,
                      tags: tuple[str, ...] = ()) -> tuple[CeilingVerdict, ...]: ...
     def remaining(self, run_id: str) -> tuple[CeilingVerdict, ...]: ...
+    def balances(self, *, scope: CeilingScope, window_key: str) -> WindowBalance: ...
+        # what one window has accumulated, naming no run and reading through no ceiling — the
+        # read a *view* needs (a per-tier dashboard over a scope no ceiling caps). Consults no
+        # ceiling, so a ledger built with none still answers. Side-effect-free, and a window with
+        # no row is reported empty rather than created. A blank window_key is refused (ValueError)
+    def position(self) -> tuple[CeilingVerdict, ...]: ...
+        # `remaining` for no particular run: every configured ceiling, PER_DAY resolved at the
+        # injected clock's UTC day. Refuses a PER_RUN ceiling with InvalidCeiling — such a cap has
+        # no window without a run, and omitting it would silently shorten a tuple whose positional
+        # correspondence with `ceilings` is documented API. An empty ledger reports the caps with
+        # nothing spent, which is true rather than a fallback reached through UnknownRun
     def entries(self, *, run_id: str | None = None, tag: str | None = None,
                 since: datetime | None = None) -> Sequence[LedgerEntry]: ...
         # `since` is inclusive. A *durable* ledger returns entries whose `debit.cost` is None:
@@ -231,8 +254,11 @@ rather than an implementation detail.
 5. **`debit` is atomic with its verdicts**: the entry and the balances it reports commit together
    (in `SqlLedger`, one transaction), so a crash cannot record spend without its verdict — the
    ADR-0044 shape applied to money.
-6. **`would_exceed` has no side effects** and is safe to call from an approval path at any
-   frequency.
+6. **The read paths have no side effects.** `would_exceed` is safe to call from an approval path
+   at any frequency, and `balances` and `position` are safe to poll from a dashboard: each opens a
+   session that is rolled back rather than committed, and **a window with no row is read as an
+   empty balance, never inserted as a zero** — a stored zero would claim something was spent and
+   priced at nothing (ADR-0016). Proven by row count, not by inspection.
 7. `PER_DAY` windows are UTC calendar days, stated in the field docs and tested across a midnight
    boundary — a budget that resets at a machine-local midnight is a different budget on every
    machine.
@@ -250,6 +276,9 @@ Constructor arguments only.
 | `STRICT` partial pricing on a ceiling with no money bound | `InvalidCeiling` — strictness is a statement about the money bound |
 | Debit currency ≠ ceiling currency | `CurrencyMismatch`, both named |
 | `remaining`/`would_exceed` for an unknown run | `UnknownRun` (a run exists once debited or declared) |
+| `balances` for a window nothing has landed in | **Not an error.** Zero tokens, no money, no counts. `UnknownRun` cannot apply — this read names no run — and "nothing has been spent here" is a true answer |
+| `balances` with a blank `window_key` | `ValueError`. A blank key names a window nothing can land in, so an empty balance would look exactly like a real one |
+| `position` with a `PER_RUN` ceiling configured | `InvalidCeiling`, naming the scope and how many. A per-run cap has no window without a run; ask about it through `remaining` |
 | `mount_ledger_tables` with a prefix that is not a SQL identifier prefix | `ValueError`. Empty is refused too: it would mount a table called `entries` into the application's own schema |
 | A session bound to a dialect other than SQLite or PostgreSQL | `UnsupportedDialect`, naming the dialect — refused at the first statement rather than attempted and found as a syntax error inside a money transaction (ADR-0006) |
 | Debit exceeding a ceiling | **Not an error.** The entry records `exceeded=True` verdicts; refusing work is the caller's policy. `would_exceed` exists so the caller can refuse *before* spending |
@@ -268,8 +297,12 @@ id. No I/O beyond the caller-supplied session. Nothing here logs.
 | `entries` for a 10 000-entry run (`InMemoryLedger`) | ≤ 100 ms |
 | `entries` for a 10 000-entry run (`SqlLedger`, SQLite) — the query | ≤ 100 ms |
 | `entries` for a 10 000-entry run (`SqlLedger`, SQLite) — fully materialized | ≤ 250 ms |
+| `balances` for one window with 10 000 entries behind it (`SqlLedger`, SQLite) | ≤ 2 ms |
+| `position` over two ledger-wide ceilings (`SqlLedger`, SQLite) | ≤ 2 ms |
 
-Balances are maintained incrementally per scope, not recomputed by summing all rows per debit.
+Balances are maintained incrementally per scope, not recomputed by summing all rows per debit —
+which is why the last two rows do not move with the size of the history: both are primary-key
+lookups over `{prefix}balances` and `{prefix}balance_money`, and neither touches `{prefix}entries`.
 
 The last row is split because the two halves fail for different reasons and a single figure hid
 that. A durable `entries()` runs one indexed query and then constructs roughly thirty-five

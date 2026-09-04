@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from baseaicore import Money, TokenUsage, is_supported
 
-from loadledger.errors import CurrencyMismatch
+from loadledger.errors import CurrencyMismatch, InvalidCeiling
 from loadledger.types import (
     BudgetCeiling,
     CeilingScope,
@@ -41,6 +41,7 @@ from loadledger.types import (
     Debit,
     LedgerEntry,
     PartialPricing,
+    WindowBalance,
 )
 
 if TYPE_CHECKING:
@@ -440,6 +441,72 @@ class BalanceBook:
             for ceiling in self._ceilings
         )
 
+    def verdicts_without_run(self, *, at: datetime) -> tuple[CeilingVerdict, ...]:
+        """Evaluate every configured ceiling, for a caller that names no run.
+
+        The ledger-wide half of :meth:`verdicts`. A ``PER_DAY`` or ``PER_TAG`` window covers every
+        run, so its balance is answerable without one — which is what a dashboard asks, and what
+        it previously had to ask by naming an arbitrary known run to satisfy a signature.
+
+        Read-only, like :meth:`verdicts`: nothing here mutates a balance.
+
+        Args:
+            at: The instant to resolve every ``PER_DAY`` window at.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order — the same positional
+            correspondence :meth:`verdicts` gives, so a caller can still pair a verdict with the
+            configuration that produced it.
+
+        Raises:
+            InvalidCeiling: If any configured ceiling is :attr:`CeilingScope.PER_RUN`. A per-run
+                cap has no window without a run, and the alternatives are both worse than
+                refusing: omitting it silently shortens a tuple whose positions are documented
+                API, and answering it against some arbitrary run reports one run's spend under a
+                heading that says "everything".
+        """
+        self.require_no_run_scope()
+        return tuple(
+            self._verdict_for(
+                ceiling,
+                run_id="",
+                at=at,
+                touched=frozenset(),
+                prospective=None,
+            )
+            for ceiling in self._ceilings
+        )
+
+    def balance_for(self, key: ScopeKey) -> WindowBalance:
+        """Return what one window has accumulated, with no ceiling read through and no run named.
+
+        A read of state this book already maintains: :meth:`record` files every debit under
+        exactly these keys, so nothing is recomputed from history here (spec §15).
+
+        Args:
+            key: The ``(scope, window_key)`` to report, as :meth:`windows_touched` or
+                :meth:`window_for` spells it.
+
+        Returns:
+            The window's :class:`~loadledger.types.WindowBalance`. A window nothing has landed in
+            reports zero tokens, no money and no counts — "nothing has been spent here" is a true
+            answer, and the window is **not** brought into existence by asking about it.
+        """
+        balance = self._balances.get(key, _EMPTY_BALANCE)
+        scope, window_key = key
+        return WindowBalance(
+            scope=scope,
+            window_key=window_key,
+            tokens_spent=balance.tokens_spent,
+            money_spent=tuple(
+                Money(currency=currency, nanos=balance.nanos_by_currency[currency])
+                for currency in sorted(balance.nanos_by_currency)
+            ),
+            unpriced_debit_count=balance.unpriced_debit_count,
+            untotalled_debit_count=balance.untotalled_debit_count,
+            unmetered_debit_count=balance.unmetered_debit_count,
+        )
+
     def _verdict_for(
         self,
         ceiling: BudgetCeiling,
@@ -549,6 +616,37 @@ class BalanceBook:
         # PER_TAG: the tag is non-None by BudgetCeiling's own validation.
         return (CeilingScope.PER_TAG, ceiling.tag or "")
 
+    def require_no_run_scope(self) -> None:
+        """Refuse a run-free evaluation over a ceiling that only a run can locate.
+
+        Raises:
+            InvalidCeiling: If any configured ceiling is :attr:`CeilingScope.PER_RUN`.
+                ``details`` names the offending scope and how many of them there are. A caller
+                that holds one ledger for every ceiling it knows about builds a second over the
+                ledger-wide subset, which is cheap: this class caches nothing between calls.
+        """
+        offenders = sum(1 for ceiling in self._ceilings if ceiling.scope is CeilingScope.PER_RUN)
+        if offenders:
+            raise InvalidCeiling(
+                f"{offenders} configured ceiling(s) are {CeilingScope.PER_RUN.value} and cannot "
+                "be evaluated without a run. Ask about a per-run ceiling through remaining(run_id)"
+                ", and build a ledger over the ledger-wide ceilings for a position that names no "
+                "run.",
+                details={"scope": CeilingScope.PER_RUN.value, "ceiling_count": offenders},
+            )
+
+    def windows_without_run(self, at: datetime) -> frozenset[ScopeKey]:
+        """Return the windows the configured ceilings read when no run is named.
+
+        :meth:`window_for` over every ceiling, with no ``run_id`` to give it — sound only once
+        :meth:`require_no_run_scope` has passed, because that is what guarantees no ceiling here
+        needs one. A durable ledger loads exactly these keys and creates none of them.
+
+        Args:
+            at: The instant to resolve every ``PER_DAY`` window at.
+        """
+        return frozenset(self.window_for(ceiling, run_id="", at=at) for ceiling in self._ceilings)
+
     def seed(
         self,
         key: ScopeKey,
@@ -637,6 +735,37 @@ class Ledger(Protocol):
 
         Raises:
             UnknownRun: If the ledger has never seen ``run_id``.
+        """
+        ...
+
+    def balances(self, *, scope: CeilingScope, window_key: str) -> WindowBalance:
+        """Report what one window has accumulated, naming no run and reading through no ceiling.
+
+        The read a *view* needs. ``remaining`` and ``would_exceed`` answer "may this run spend"
+        and "what has this run spent", both through a configured cap; neither can answer "what
+        has been spent in this window", which is what a per-tier or per-day dashboard asks. The
+        two ways to answer it from outside — summing ``entries`` in the consumer, or configuring
+        a ceiling nobody intends to enforce purely to read a number through — are ledger
+        arithmetic in an application and a fabricated cap in the record respectively.
+
+        Side-effect-free: a window with no balance is reported as empty, never created.
+
+        Raises:
+            ValueError: If ``window_key`` is blank. A blank key names a window nothing can land
+                in, so answering "nothing spent" would look exactly like answering it for a real
+                window and would hide the caller's bug.
+        """
+        ...
+
+    def position(self) -> tuple[CeilingVerdict, ...]:
+        """Report every configured ceiling's current balance, for no particular run.
+
+        The ledger-wide counterpart of :meth:`remaining`. ``PER_DAY`` ceilings are reported for
+        the UTC day the injected clock is in.
+
+        Raises:
+            InvalidCeiling: If any configured ceiling is ``PER_RUN``. Such a cap has no window
+                without a run; ask about it through :meth:`remaining` instead.
         """
         ...
 

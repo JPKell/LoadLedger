@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from baseaicore import Clock, CostEstimate, TokenUsage
 
-    from loadledger.types import BudgetCeiling, CeilingVerdict, Debit
+    from loadledger.types import BudgetCeiling, CeilingScope, CeilingVerdict, Debit, WindowBalance
 
 __all__ = ["InMemoryLedger"]
 
@@ -185,6 +185,57 @@ class InMemoryLedger:
             self._require_known(run_id)
             return self._book.verdicts(run_id=run_id, at=self._clock())
 
+    def balances(self, *, scope: CeilingScope, window_key: str) -> WindowBalance:
+        """Report what one window has accumulated, naming no run and reading through no ceiling.
+
+        The read a *view* needs, and the one :meth:`remaining` cannot give: a ``per_tag`` window
+        with no ceiling over it has a balance, it simply has nothing to be measured against. No
+        ceiling is consulted here at all, so a ledger built with none still answers.
+
+        Side-effect-free, and no window is created by being asked about — asking about a tag
+        nothing has been debited under leaves this ledger holding exactly the windows it held
+        before.
+
+        Args:
+            scope: Which kind of window to report.
+            window_key: The window within that scope — a ``run_id`` for ``PER_RUN``, a UTC day key
+                for ``PER_DAY``, a tag for ``PER_TAG``. ``PER_DAY`` keys are the ones
+                :func:`~loadledger.core.utc_day_key` produces; a raw date string in some other
+                shape names a window nothing landed in, and gets an empty balance rather than a
+                correction.
+
+        Returns:
+            The window's :class:`~loadledger.types.WindowBalance`, with the three honesty counts
+            — identical to what a :class:`~loadledger.types.CeilingVerdict` over the same window
+            reports, because both come from the same balance.
+
+        Raises:
+            ValueError: If ``window_key`` is blank. A blank key names a window nothing can land
+                in, so an empty balance would look exactly like a real one and hide the bug.
+        """
+        _require_window_key(window_key)
+        with self._lock:
+            return self._book.balance_for((scope, window_key))
+
+    def position(self) -> tuple[CeilingVerdict, ...]:
+        """Report every configured ceiling's current balance, for no particular run.
+
+        The ledger-wide counterpart of :meth:`remaining`, for a dashboard that is not about one
+        run. ``PER_DAY`` ceilings are reported for the UTC day the injected clock is in — the
+        window a debit made now would land in.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order, with nothing prospective
+            added. An empty ledger reports the configured caps with nothing spent, which is true
+            rather than a fallback.
+
+        Raises:
+            InvalidCeiling: If any configured ceiling is ``PER_RUN``. A per-run cap has no window
+                without a run; :meth:`remaining` is where to ask about one.
+        """
+        with self._lock:
+            return self._book.verdicts_without_run(at=self._clock())
+
     def entries(
         self,
         *,
@@ -236,6 +287,12 @@ class InMemoryLedger:
                 "would look exactly like reporting one for a run that has spent nothing.",
                 details={"run_id": run_id},
             )
+
+
+def _require_window_key(window_key: str) -> None:
+    """Raise :class:`ValueError` unless ``window_key`` names a window something could land in."""
+    if not isinstance(window_key, str) or not window_key.strip():
+        raise ValueError(f"window_key must be a non-blank window identifier; got {window_key!r}.")
 
 
 def _at(entry: LedgerEntry) -> datetime:

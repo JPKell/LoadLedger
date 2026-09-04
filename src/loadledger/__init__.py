@@ -54,6 +54,7 @@ from loadledger.types import (
     Debit,
     LedgerEntry,
     PartialPricing,
+    WindowBalance,
 )
 
 __all__ = [
@@ -71,6 +72,7 @@ __all__ = [
     "PartialPricing",
     "UnknownRun",
     "UnsupportedDialect",
+    "WindowBalance",
     "__version__",
     "utc_day_key",
     "utc_day_start",

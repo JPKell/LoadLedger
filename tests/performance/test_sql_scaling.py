@@ -9,6 +9,8 @@ in the suite. Numbers are from CPython 3.13 on the development machine, SQLite o
 | `would_exceed` | ≤ 2 ms | ~0.4 ms |
 | `entries` for a 10 000-entry run — the query | ≤ 100 ms | ~17 ms |
 | `entries` for a 10 000-entry run — fully materialized | ≤ 250 ms | ~155 ms |
+| `balances` for one window, 10 000 entries behind it | ≤ 2 ms | ~0.2 ms |
+| `position` over two ledger-wide ceilings | ≤ 2 ms | ~0.3 ms |
 
 The last two rows are one row split in two, and the split is the point. `SqlLedger` did not exist
 when §15 was written, so its single ≤ 100 ms figure was set against the in-memory ledger, which
@@ -162,3 +164,38 @@ def test_the_history_query_and_its_materialization_each_meet_their_budget(
         f"materializing {DEBITS} entries took {materialized_ms:.0f} ms against spec §15's "
         "250 ms; the measured figure is ~155 ms, so this is a regression"
     )
+
+
+@pytest.mark.performance
+def test_a_balance_read_does_not_touch_the_entry_history(
+    ledger_on_disk: tuple[SqlLedger, Engine, LedgerTables],
+) -> None:
+    """Spec §15's `balances`/`position` row — and the reason the read was added at all.
+
+    A consumer that could not ask for a window's balance had two options, and both were the thing
+    this asserts against: summing `entries()` in the application, which is the ~155 ms
+    materialization above plus ledger arithmetic in a consumer, or configuring a ceiling nobody
+    intends to enforce. Both reads here are primary-key lookups over `{prefix}balances` and
+    `{prefix}balance_money`, so ten thousand entries cost exactly what none do.
+    """
+    ledger, engine, _ = ledger_on_disk
+    elapsed_ms_over(ledger, 0, DEBITS)
+
+    calls = 200
+    began = time.perf_counter_ns()
+    for _ in range(calls):
+        ledger.balances(scope=CeilingScope.PER_TAG, window_key="tier:local_fast")
+    per_balance = (time.perf_counter_ns() - began) / 1_000_000 / calls
+    assert per_balance <= 2.0, f"{per_balance:.2f} ms per balances against spec §15's 2 ms"
+
+    # `position` refuses a per-run ceiling, so a ledger-wide read is built over the rest.
+    ledger_wide = SqlLedger(
+        sessionmaker(bind=engine),
+        [one for one in CEILINGS if one.scope is not CeilingScope.PER_RUN],
+        clock=ManualClock(),
+    )
+    began = time.perf_counter_ns()
+    for _ in range(calls):
+        ledger_wide.position()
+    per_position = (time.perf_counter_ns() - began) / 1_000_000 / calls
+    assert per_position <= 2.0, f"{per_position:.2f} ms per position against spec §15's 2 ms"

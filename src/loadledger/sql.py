@@ -62,6 +62,7 @@ from loadledger.types import (
     Debit,
     LedgerEntry,
     PartialPricing,
+    WindowBalance,
 )
 
 if TYPE_CHECKING:
@@ -575,6 +576,79 @@ class SqlLedger:
             book = BalanceBook(self._book_ceilings)
             self._seed_from_rows(book, session, self._windows_read(run_id, now))
             return book.verdicts(run_id=run_id, at=now)
+
+    def balances(self, *, scope: CeilingScope, window_key: str) -> WindowBalance:
+        """Report what one window has accumulated, naming no run and reading through no ceiling.
+
+        The read a *view* needs, and the one :meth:`remaining` cannot give: a ``per_tag`` window
+        with no ceiling over it has a balance, it simply has nothing to be measured against. No
+        ceiling is consulted, so a ledger built with none still answers — which is what makes this
+        a read of ``{prefix}balances`` and ``{prefix}balance_money`` and nothing else. One indexed
+        lookup per table on the primary key; the entry history is never touched, which is the
+        whole point of it (spec §15).
+
+        Side-effect-free, and structurally so (spec contract 6): the session this opens is rolled
+        back and closed rather than committed, and **a window with no row is not created**. That
+        is the easy contract to break here — a missing row is read as an empty balance, never
+        inserted as a zero, because a stored zero would claim something was spent and priced at
+        nothing (ADR-0016).
+
+        Args:
+            scope: Which kind of window to report.
+            window_key: The window within that scope — a ``run_id`` for ``PER_RUN``, a UTC day key
+                for ``PER_DAY``, a tag for ``PER_TAG``. ``PER_DAY`` keys are the ones
+                :func:`~loadledger.core.utc_day_key` produces; a raw date string in some other
+                shape names a window nothing landed in, and gets an empty balance rather than a
+                correction.
+
+        Returns:
+            The window's :class:`~loadledger.types.WindowBalance`, with the three honesty counts
+            — identical to what a :class:`~loadledger.types.CeilingVerdict` over the same window
+            reports, because both are seeded from the same rows through the same
+            :class:`~loadledger.core.BalanceBook`.
+
+        Raises:
+            ValueError: If ``window_key`` is blank. A blank key names a window nothing can land
+                in, so an empty balance would look exactly like a real one and hide the bug.
+            UnsupportedDialect: If the session is bound to anything but SQLite or PostgreSQL.
+        """
+        if not isinstance(window_key, str) or not window_key.strip():
+            raise ValueError(
+                f"window_key must be a non-blank window identifier; got {window_key!r}."
+            )
+        key: ScopeKey = (scope, window_key)
+        book = BalanceBook(())
+        with self._reading() as session:
+            self._seed_from_rows(book, session, frozenset({key}))
+        return book.balance_for(key)
+
+    def position(self) -> tuple[CeilingVerdict, ...]:
+        """Report every configured ceiling's current balance, for no particular run.
+
+        The ledger-wide counterpart of :meth:`remaining`, for a dashboard that is not about one
+        run. ``PER_DAY`` ceilings are reported for the UTC day the injected clock is in — the
+        window a debit made now would land in.
+
+        Side-effect-free on the same terms as :meth:`would_exceed`: the session is rolled back,
+        and a window a ceiling reads but nothing has landed in stays absent.
+
+        Returns:
+            One verdict per configured ceiling, in configuration order, with nothing prospective
+            added. An empty ledger reports the configured caps with nothing spent, which is true
+            rather than a fallback — and is the difference between this and naming an arbitrary
+            known run to satisfy :meth:`remaining`'s signature.
+
+        Raises:
+            InvalidCeiling: If any configured ceiling is ``PER_RUN``. A per-run cap has no window
+                without a run; :meth:`remaining` is where to ask about one.
+            UnsupportedDialect: If the session is bound to anything but SQLite or PostgreSQL.
+        """
+        book = BalanceBook(self._book_ceilings)
+        book.require_no_run_scope()
+        now = self._clock()
+        with self._reading() as session:
+            self._seed_from_rows(book, session, book.windows_without_run(now))
+            return book.verdicts_without_run(at=now)
 
     def entries(
         self,

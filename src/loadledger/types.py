@@ -37,6 +37,7 @@ __all__ = [
     "Debit",
     "LedgerEntry",
     "PartialPricing",
+    "WindowBalance",
 ]
 
 
@@ -397,6 +398,79 @@ class CeilingVerdict:
             ),
             "tokens_spent": self.tokens_spent,
             "tokens_remaining": self.tokens_remaining,
+            "unpriced_debit_count": self.unpriced_debit_count,
+            "untotalled_debit_count": self.untotalled_debit_count,
+            "unmetered_debit_count": self.unmetered_debit_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WindowBalance:
+    """What one scope window has accumulated, read without naming a run or a ceiling.
+
+    The shape :class:`CeilingVerdict` cannot take. A verdict is about a **bound** — it exists to
+    say whether one was crossed and how much of it is left — so reporting a window that has no
+    ceiling through one would mean a verdict with no ceiling on it and two permanently meaningless
+    fields, which invites a caller to ask whether something was exceeded when nothing here has a
+    bound to exceed. This type answers the other question: what has landed in this window, and how
+    complete that figure is.
+
+    The honesty counts ride on it for the same reason they ride on every verdict (spec contract
+    2): a balance handed over without them is a floor presenting itself as a total, and a view
+    that cannot say "at least" is the failure ADR-0069 exists to prevent.
+
+    Attributes:
+        scope: Which kind of window this is.
+        window_key: The window's key within that scope — a ``run_id`` for
+            :attr:`CeilingScope.PER_RUN`, a ``YYYY-MM-DD`` UTC day key for
+            :attr:`CeilingScope.PER_DAY` (:func:`~loadledger.core.utc_day_key` spells it), a tag
+            for :attr:`CeilingScope.PER_TAG`.
+        tokens_spent: Tokens counted in this window, summed over the classes providers actually
+            reported. ``0`` for a window nothing has landed in, which is the true answer and not a
+            fabrication: no debit means no tokens, whereas an *unreported* class is excluded
+            rather than counted as zero and shows up in :attr:`unmetered_debit_count` instead.
+        money_spent: One :class:`~baseaicore.Money` per currency anything in this window was
+            priced in, ascending by currency code and at most one per currency. **Never summed
+            across currencies** (ADR-0030 rule 3): converting needs an exchange rate this package
+            will not assume, so a window priced in two currencies reports two figures and no
+            total. A currency that is absent has had nothing priced in it, which reads differently
+            from zero (ADR-0016), and an empty tuple means nothing at all has been priced here —
+            which is why it is a tuple of what exists rather than a row per currency the caller
+            asked about. Every figure is a **floor** whenever :attr:`unpriced_debit_count` is
+            non-zero; render it as "at least", never as a bare figure.
+        unpriced_debit_count: How many debits in this window added less than their full cost: no
+            estimate at all, or an estimate that did not total. Their tokens are in
+            :attr:`tokens_spent`; only the components that were priced are in
+            :attr:`money_spent`.
+        untotalled_debit_count: The subset of :attr:`unpriced_debit_count` that carried an
+            estimate which did not total. This is what a :attr:`PartialPricing.STRICT` ceiling
+            fires on — but nothing here fires, because nothing here has a cap.
+        unmetered_debit_count: How many debits in this window left at least one token class
+            unreported, making :attr:`tokens_spent` a floor too.
+    """
+
+    scope: CeilingScope
+    window_key: str
+    tokens_spent: int = 0
+    money_spent: tuple[Money, ...] = ()
+    unpriced_debit_count: int = 0
+    untotalled_debit_count: int = 0
+    unmetered_debit_count: int = 0
+
+    def as_canonical(self) -> dict[str, Any]:
+        """Return the mapping form used inside canonical JSON, and therefore inside goldens.
+
+        Returns:
+            Every field, with each :class:`~baseaicore.Money` in its own canonical
+            ``{"currency", "nanos"}`` form and the money list in the order it is held, which is
+            ascending by currency code — so equal balances serialize byte-identically on every
+            platform and Python version (spec contract 4).
+        """
+        return {
+            "scope": self.scope.value,
+            "window_key": self.window_key,
+            "tokens_spent": self.tokens_spent,
+            "money_spent": [money.as_canonical() for money in self.money_spent],
             "unpriced_debit_count": self.unpriced_debit_count,
             "untotalled_debit_count": self.untotalled_debit_count,
             "unmetered_debit_count": self.unmetered_debit_count,

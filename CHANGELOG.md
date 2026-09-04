@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 [Semantic Versioning](https://semver.org/), pre-1.0 per
 packaging and release standards §3.
 
+## [Unreleased]
+
+### Added
+- `Ledger.balances(*, scope, window_key)` on the protocol, `InMemoryLedger` and `SqlLedger`, with
+  the `WindowBalance` value object it returns: what one scope window has accumulated, **naming no
+  run and reading through no ceiling**. Consults no ceiling at all, so a ledger built with none
+  still answers — which is the point, because the consumer this exists for (`--scope tier` in
+  PromptCadence) caps nothing per tier and still has spend to show. The alternatives it retires
+  are summing `entries()` in the application (ledger arithmetic in a consumer, which ADR-0050's
+  mount exists to prevent) and configuring a ceiling nobody intends to enforce purely to read a
+  number through (a fabricated cap in the record).
+- `Ledger.position()` on all three: `remaining` for **no particular run** — every configured
+  ceiling, `PER_DAY` resolved at the injected clock's UTC day. This is the half that actually
+  retires the reference-run workaround `F1_HANDOFF.md` §7 recorded, because `balances` alone fixes
+  a scope with no ceiling while a scope *with* one needs headroom, and deriving headroom outside
+  the package would put the floor rule and the `exceeded` decision in a consumer. An empty ledger
+  reports the configured caps with nothing spent — true as a fact, where the previous answer was
+  identical but reached through an `UnknownRun` fallback.
+- `WindowBalance` carries all three honesty counts, and they are the same numbers a
+  `CeilingVerdict` over the same window reports — asserted on both implementations, because a
+  dashboard reading one beside an approval reading the other must not see two truths about one
+  window. Its money is a **tuple, one figure per currency, ascending by code and never summed
+  across them** (ADR-0030 rule 3): a window's currency set is open, so one total would be a
+  conversion. An empty tuple means nothing at all has been priced here; an absent currency has had
+  nothing priced in it, which is not zero (ADR-0016).
+- Spec §15 budgets for both reads (≤ 2 ms each, measured ~0.2 ms and ~0.3 ms with 10 000 entries
+  behind them), asserted in `tests/performance/`. Neither moves with the size of the history:
+  both are primary-key lookups over `{prefix}balances` and `{prefix}balance_money` and neither
+  touches `{prefix}entries`.
+
+### Changed
+- Spec §11 contract 6 now covers all three read paths rather than `would_exceed` alone, and states
+  the proof: the session is rolled back, and a window with no row is read as an empty balance
+  rather than inserted as a zero — asserted by row count.
+
+### Notes
+- **No table, column or index changed; hosts need no migration.** `{prefix}balances` is already
+  keyed `(scope, window_key)` and `{prefix}balance_money` `(scope, window_key, currency)`, which is
+  exactly the query these reads expose. Nothing is owed to
+  `docs/mounted-table-upgrades.md`.
+- `window_keys(scope)` was considered and **not** shipped. It is cheap on both dialects, but the
+  consumer this release exists for knows its tier names from its own configuration and never asks;
+  an unused public method in a 0.x package is surface that has to be kept and versioned.
+- `position()` **refuses** a `PER_RUN` ceiling with `InvalidCeiling` rather than omitting it from
+  the result. Omitting would silently shorten a tuple whose positional correspondence with
+  `ceilings` is documented API; answering it against some arbitrary run would report one run's
+  spend under a ledger-wide heading. A caller holding one ledger for every ceiling it knows about
+  builds a second over the ledger-wide subset, which is free — `SqlLedger` caches nothing.
+- `balances()` refuses a blank `window_key` with `ValueError`, on `declare_run`'s precedent: a
+  blank key names a window nothing can land in, so an empty balance would look exactly like a real
+  one.
+
 ## [0.1.0] — 2026-09-02
 
 ### Added
