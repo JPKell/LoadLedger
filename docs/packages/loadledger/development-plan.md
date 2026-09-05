@@ -132,7 +132,7 @@ found.
   ceiling with `InvalidCeiling` because such a cap has no window without a run. Mechanically it is
   `BalanceBook.verdicts` minus its `run_id` and `SqlLedger._windows_read` minus the `PER_RUN` key:
   the same engine, the same honesty counts, no new storage. `balances()` alone does not close the
-  gap `F1_HANDOFF.md` §7 names — it fixes `--scope tier`, but `--scope day` and `--scope project`
+  gap `docs/history/F1_HANDOFF.md` §7 names — it fixes `--scope tier`, but `--scope day` and `--scope project`
   need **headroom against a configured ceiling**, and deriving that outside the package would put
   the floor rule and the `exceeded` decision in a consumer. Without this method the reference-run
   workaround survives.
@@ -142,7 +142,7 @@ found.
 
 **Why this exists.** Spec §7's surface answers "may this run spend" and "what has this run spent".
 It cannot answer "what has been spent in this window", which is what a dashboard asks and what
-PromptCadence needed for its per-tier and per-day views (`F1_HANDOFF.md` §7). The two ways to
+PromptCadence needed for its per-tier and per-day views (`docs/history/F1_HANDOFF.md` §7). The two ways to
 answer it from outside are summing `entries()` in the application — ledger arithmetic in a
 consumer, which is what ADR-0050's mount exists to prevent — or configuring a ceiling nobody
 intends to enforce purely to read a number through, which puts a fabricated cap in the record.
