@@ -8,9 +8,9 @@ alembic==1.19.1 \
     --hash=sha256:b39018cb3d9413a19cbd54cf3c02ad33998641f0538eb77413a488a21c3e14be \
     --hash=sha256:e0fca0518118c78acc493e31bcb5402f190057aaf6df8b5b95ce94c4789cf648
     # via loadledger (pyproject.toml)
-baseaicore==0.4.1 \
-    --hash=sha256:08739699d4770c07e89975980a99978213d499dd8e5b9784b5de3fceb472172a \
-    --hash=sha256:94fd95a67e758398a7951e83e2ef45c92ee6650fe2c163362758b77bf674b91f
+baseaicore==0.4.2 \
+    --hash=sha256:be055b82d8858189b032bc2e3de85a68b2ab35d6792481eebbc8817fe3e486d0 \
+    --hash=sha256:c4f82cdd698d85ca7e23dd175b1f6c61f9a38f5c9b194d0a308a5d38ff7c6110
     # via loadledger (pyproject.toml)
 click==8.5.0 \
     --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360 \
