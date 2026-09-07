@@ -7,6 +7,8 @@ packaging and release standards §3.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-07
+
 ### Added
 - `loadledger.pricing`: the reader for an ADR-0072 price catalogue —
   `load_pricing_records(path)`, `price_for_model(records, *, canonical_id, at)` and
