@@ -7,10 +7,15 @@ acquired), no currency conversion (ADR-0030 rule 3), and no policy — the ledge
 this exceed?" and "what remains?", and halting, pausing or re-approving is the caller's decision.
 
 This module is pure: no I/O, no SQL, no logging, no environment, and `baseaicore` is its only
-dependency. Durability lives in ``loadledger.sql`` — ``mount_ledger_tables`` and ``SqlLedger``,
-under the ``loadledger[sql]`` extra — which is deliberately **not** imported here, so installing
-this package never drags in an ORM (ADR-0050 decision 4). Import it explicitly:
-``from loadledger.sql import SqlLedger``.
+dependency. Two submodules are deliberately **not** imported here, so importing ``loadledger``
+never opens a file and never drags in an ORM (ADR-0050 decision 4); import each explicitly:
+
+* ``loadledger.sql`` — ``mount_ledger_tables`` and ``SqlLedger``, durability, under the
+  ``loadledger[sql]`` extra: ``from loadledger.sql import SqlLedger``.
+* ``loadledger.pricing`` — the ADR-0072 price-catalogue reader, which is file I/O and no more
+  than that: ``from loadledger.pricing import load_pricing_records, price_for_model``. It reads
+  the prices an operator wrote down; the "no pricing" non-goal in the spec is undisturbed, since
+  nothing here invents, converts or extrapolates a rate (ADR-0110).
 
     >>> from datetime import UTC, datetime
     >>> from baseaicore import Money, TokenUsage
@@ -43,6 +48,7 @@ from loadledger.errors import (
     CurrencyMismatch,
     InvalidCeiling,
     LedgerError,
+    PricingFileError,
     UnknownRun,
     UnsupportedDialect,
 )
@@ -70,6 +76,7 @@ __all__ = [
     "LedgerEntry",
     "LedgerError",
     "PartialPricing",
+    "PricingFileError",
     "UnknownRun",
     "UnsupportedDialect",
     "WindowBalance",

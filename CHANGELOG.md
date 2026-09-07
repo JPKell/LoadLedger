@@ -7,6 +7,34 @@ packaging and release standards §3.
 
 ## [Unreleased]
 
+### Added
+- `loadledger.pricing`: the reader for an ADR-0072 price catalogue —
+  `load_pricing_records(path)`, `price_for_model(records, *, canonical_id, at)` and
+  `records_claiming(records, *, at)`, with `PricingFileError` (`LEDGER_PRICING_FILE_INVALID`)
+  in the existing hierarchy. Moved here from `promptcadence.services.pricing`, which IdeaPress had
+  transcribed at row J1 — the second consumer ADR-0072 §8 named as its own extraction trigger
+  (ADR-0110). The module reads the prices an operator wrote down and resolves which one applies;
+  it still invents, converts and extrapolates nothing, so spec §3's pricing non-goal narrows
+  rather than lifts.
+- A **golden-hash** test. `pricing_hash` is the join between a stored usage and the price it was
+  costed under (ADR-0030 rule 1), so a moved reader that produced an equal-looking record with a
+  different hash would silently re-price two applications' history.
+  `tests/data/adr0072_catalogue.json` loads to the exact hashes both applications' own loaders
+  produced on that file before either adopted this package.
+
+### Notes
+- **Not exported from `loadledger/__init__.py`.** The module opens files and the package root
+  promises it does not — the rule `loadledger.sql` already follows. Import it explicitly:
+  `from loadledger.pricing import load_pricing_records`.
+- **No new dependency**, no table, no column, no migration. `json` and `pathlib` are stdlib, and
+  nothing here touches a session. Hosts owe `docs/mounted-table-upgrades.md` nothing.
+- **Functions over a sequence, not a catalogue class.** The two consumers hold two different
+  containers — PromptCadence a per-tier map, IdeaPress a flat list — so a class here would be a
+  name for a tuple and would force one of them to wrap. A third consumer with a third shape is the
+  revisit trigger (spec §21).
+- The refusal messages moved **verbatim**. They are what an operator repairs a hand-maintained
+  price list from, and both applications' existing tests match on them.
+
 ## [0.2.0] — 2026-09-04
 
 ### Added

@@ -1,7 +1,7 @@
 # LoadLedger — Specification
 
 **Type:** Python package · **Import/distribution name:** `loadledger` · **Layer:** 3 (capability package)
-**Status:** Implemented and published as `loadledger 0.2.0`. Part of the PromptCadence arc
+**Status:** Implemented; `loadledger 0.3.0` prepared (published: `0.2.0`). Part of the PromptCadence arc
 ([roadmap](../../roadmap/promptcadence-roadmap.md)); builds entirely on
 [ADR-0030](../../adr/0030-model-cost-and-pricing.md)'s types — no new cost primitives — and
 introduces no persistence of its own beyond the mountable-models pattern (roadmap §2, D-6).
@@ -32,12 +32,19 @@ a piece of content cost to produce") — accumulates the same entries per unit a
 * `InMemoryLedger` (the deterministic test double, first-class) and `SqlLedger` over the mountable
   models in `loadledger.sql`.
 * Ceiling evaluation: multiple active ceilings, most restrictive binds, every verdict explicable.
+* `loadledger.pricing`: the reader for an [ADR-0072](../../adr/0072-the-model-pricing-record-file.md)
+  price catalogue — the file format, its refusals, and which record prices one call at one instant.
+  It reads a path it is handed and resolves observations; it does not decide where the path came
+  from, what a missing file means, or what any rate should be ([ADR-0110](../../adr/0110-the-pricing-file-reader-is-a-loadledger-surface.md)).
 
 ## 3. Explicit non-goals
 
-* **No pricing.** Prices arrive as `ModelPricing` records the caller acquired
-  ([ADR-0030](../../adr/0030-model-cost-and-pricing.md) — acquisition belongs to applications);
-  LoadLedger applies `baseaicore.estimate_cost` and never invents, converts or extrapolates a rate.
+* **No pricing decisions.** LoadLedger applies `baseaicore.estimate_cost` and never invents,
+  converts or extrapolates a rate ([ADR-0030](../../adr/0030-model-cost-and-pricing.md)).
+  `loadledger.pricing` narrows this non-goal without weakening it: since 0.3.0 the package *reads*
+  the observations an operator wrote in an ADR-0072 file, because the `pricing_hash` join is only
+  sound if one reader produces them (ADR-0110). Nothing here fetches a price, defaults one, or
+  fills a gap — an unpriceable call stays unpriced.
 * **No currency conversion**, inherited from ADR-0030 rule 3.
 * **No policy.** LoadLedger answers "would this exceed?" and "what remains?"; halting, pausing or
   re-approving is the caller's decision.
@@ -59,7 +66,9 @@ a piece of content cost to produce") — accumulates the same entries per unit a
 ## 5. Dependencies
 
 `baseaicore`. `loadledger.sql` additionally imports `sqlalchemy>=2,<3` (an optional extra:
-`loadledger[sql]`). No sibling capability package — deliberately not `weightsdb`, whose
+`loadledger[sql]`). `loadledger.pricing` adds nothing: `json` and `pathlib` are stdlib, and it is
+kept out of `loadledger/__init__.py` for the same reason `sql` is — importing the package root
+opens no file and starts no ORM. No sibling capability package — deliberately not `weightsdb`, whose
 engine/session/migration machinery belongs to the application that owns the database.
 
 ## 6. Consumers
@@ -181,10 +190,40 @@ def mount_ledger_tables(metadata: MetaData, *, prefix: str = "ledger_") -> Ledge
 # it to one of its own entities is doing what ADR-0050 decision 2 forbids. Commissioner's
 # `mount_egress_tables` returns the same kind of object, with its own field names.
 
+# loadledger.pricing — the ADR-0072 catalogue reader (ADR-0110). No extra dependency, and like
+# `sql` it is never imported from `loadledger/__init__.py`, because it does file I/O.
+def load_pricing_records(path: Path) -> tuple[ModelPricing, ...]: ...
+# JSON, one object with a `records` array, each record a ModelPricing written field for field with
+# its identity flattened. Rates are decimal STRINGS (a JSON number is refused, not coerced); an
+# omitted rate is UNSUPPORTED and `"0"` is a real zero; `source` and `observed_at` are required.
+# File order preserved; an empty array loads to (), because a file that states no prices prices
+# nothing and the refusal for that belongs to whatever named the file. Every other failure is
+# PricingFileError, naming the file and, where one applies, the record index and the field
+
+def price_for_model(records: Sequence[ModelPricing], *, canonical_id: str,
+                    at: datetime) -> ModelPricing | None: ...
+# The record to cost one call. Matches on provider kind + provider model name; a record STATING a
+# digest matches only that digest, one stating none matches those weights under any digest
+# (ADR-0072 §5 — the rule most often got backwards). Among those claiming `at`, the latest
+# `observed_at` wins. None means nothing covers these weights — never free: the caller records the
+# usage unpriced, and the ledger counts it (ADR-0016, ADR-0069)
+
+def records_claiming(records: Sequence[ModelPricing], *,
+                     at: datetime) -> tuple[ModelPricing, ...]: ...
+# Every record claiming the instant, whatever weights it names — what a pre-flight estimate has to
+# work with before a backend has chosen a model. The caller costs against all of them and takes
+# the largest, because only the worst case cannot under-state a budget (ADR-0072 §6)
+
+# The caller keeps the container: PromptCadence holds one tuple per tier, IdeaPress one flat
+# tuple. A catalogue class here would be a name for a tuple, and the shapes differ per application
+
 # Errors (subclass baseaicore.SuiteError)
 LedgerError                LEDGER_ERROR
 ├── CurrencyMismatch       LEDGER_CURRENCY_MISMATCH   # ceiling USD, debit EUR — refused, not converted
 ├── InvalidCeiling         LEDGER_CEILING_INVALID     # incl. STRICT partial pricing with no money bound
+├── PricingFileError       LEDGER_PRICING_FILE_INVALID # an ADR-0072 catalogue is missing, unreadable,
+│                                                     # not JSON, or holds a record the rules refuse.
+│                                                     # Raised from loadledger.pricing only
 ├── UnknownRun             LEDGER_UNKNOWN_RUN
 └── UnsupportedDialect     LEDGER_UNSUPPORTED_DIALECT # a session bound to anything but SQLite or
                                                       # PostgreSQL (ADR-0006). Raised from
@@ -281,6 +320,10 @@ Constructor arguments only.
 | `position` with a `PER_RUN` ceiling configured | `InvalidCeiling`, naming the scope and how many. A per-run cap has no window without a run; ask about it through `remaining` |
 | `mount_ledger_tables` with a prefix that is not a SQL identifier prefix | `ValueError`. Empty is refused too: it would mount a table called `entries` into the application's own schema |
 | A session bound to a dialect other than SQLite or PostgreSQL | `UnsupportedDialect`, naming the dialect — refused at the first statement rather than attempted and found as a syntax error inside a money transaction (ADR-0006) |
+| A pricing file that is missing, unreadable, not JSON, or has no `records` array | `PricingFileError`, naming the file. Read at startup precisely so this is a refusal to start rather than real spend nobody can cost (ADR-0072 §7) |
+| A pricing record the rules cannot turn into a `ModelPricing` | `PricingFileError`, naming the file, the record index and the field. A refusal that does not say which line of a hand-maintained price list is wrong is one an operator cannot act on |
+| A rate written as a JSON number | `PricingFileError`. Refused, never coerced: a price that arrived as a float has already lost the value the whole-nanos arithmetic protects |
+| `price_for_model` finding no record for the weights | **Not an error.** `None` — and `None` is not free; the caller records the usage unpriced and the ledger counts it |
 | Debit exceeding a ceiling | **Not an error.** The entry records `exceeded=True` verdicts; refusing work is the caller's policy. `would_exceed` exists so the caller can refuse *before* spending |
 
 ## 14. Security considerations
@@ -331,6 +374,7 @@ No logging. `LedgerEntry` is exactly the body of the suite's `budget.debited` ev
 | Atomicity | Kill mid-debit (SQLite + PostgreSQL): entry and verdicts both present or both absent |
 | Determinism | Golden verdict serializations across the matrix |
 | Mounting | Two schemas in two databases from one `mount_ledger_tables`; Alembic autogenerate in a host app picks the tables up; prefix respected |
+| Pricing file | Every format rule and every refusal of ADR-0072, over the fixture both applications carry; and a **golden-hash** case asserting that the records this reader builds hash to the same `pricing_hash` each application's own loader produced before it adopted this module — a moved reader that changed a hash would silently re-price two databases of history |
 | Errors | Every §13 row |
 
 Coverage floor: **95 %**.
@@ -356,6 +400,9 @@ migration, so the recipe is documentation plus a helper, never an auto-migration
 * IdeaPress adoption: per-unit and per-project scopes are `PER_RUN`/`PER_TAG` as-is; the adoption
   phase decides its tags and sets a per-output and a per-project ceiling from IdeaPress's
   configuration (roadmap row J1).
+* A catalogue *type* over the records (`for_model` as a method rather than a function taking a
+  sequence), if a third consumer wants one shape. Two consumers want two — a per-tier map and a
+  flat list — so the package ships the functions and each application keeps its own container.
 * Composite windows (`PER_RUN` × tag, `PER_DAY` × tag) as additional scope values, if a consumer
   needs a tag cap that resets; the persisted balance key (scope, window key) already admits them.
 * A price-catalogue helper, only at ADR-0030's own trigger (two consumers independently

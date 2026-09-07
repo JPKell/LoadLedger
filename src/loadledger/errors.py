@@ -21,6 +21,7 @@ __all__ = [
     "CurrencyMismatch",
     "InvalidCeiling",
     "LedgerError",
+    "PricingFileError",
     "UnknownRun",
     "UnsupportedDialect",
 ]
@@ -57,6 +58,23 @@ class InvalidCeiling(LedgerError):
     """
 
     code: ClassVar[str] = "LEDGER_CEILING_INVALID"
+
+
+class PricingFileError(LedgerError):
+    """An ADR-0072 price catalogue could not be read, or holds a record the rules refuse.
+
+    Raised only from ``loadledger.pricing``; the pure core never opens a file. ``details`` names
+    the ``file`` and, where one applies, the ``record`` index and the ``field`` — because a
+    refusal that does not say which line of a hand-maintained price list is wrong is a refusal an
+    operator cannot act on.
+
+    A caller reads its catalogue at startup precisely so that this is a refusal to start rather
+    than a run that spends money nobody can cost, and it translates this into its own
+    configuration vocabulary: *which* key named the unreadable file is the application's fact, not
+    the reader's.
+    """
+
+    code: ClassVar[str] = "LEDGER_PRICING_FILE_INVALID"
 
 
 class UnknownRun(LedgerError):

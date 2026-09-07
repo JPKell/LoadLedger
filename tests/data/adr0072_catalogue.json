@@ -1,0 +1,55 @@
+{
+  "records": [
+    {
+      "provider_kind": "openai_compatible",
+      "provider_model_name": "gpt-4o",
+      "artifact_digest": null,
+      "source": "provider_published",
+      "observed_at": "2026-09-01T00:00:00Z",
+      "effective_from": null,
+      "effective_until": null,
+      "price_tier": "standard",
+      "region": null,
+      "rates": {
+        "currency": "USD",
+        "input_per_million_tokens": "2.50",
+        "output_per_million_tokens": "10.00",
+        "cache_write_per_million_tokens": "3.125",
+        "cache_read_per_million_tokens": "0.25"
+      }
+    },
+    {
+      "provider_kind": "ollama",
+      "provider_model_name": "gemma4:12b",
+      "artifact_digest": null,
+      "source": "user_override",
+      "observed_at": "2026-09-01T00:00:00Z",
+      "effective_from": null,
+      "effective_until": null,
+      "price_tier": null,
+      "region": null,
+      "rates": {
+        "currency": "USD",
+        "input_per_million_tokens": "2.50",
+        "output_per_million_tokens": "10.00"
+      }
+    },
+    {
+      "provider_kind": "ollama",
+      "provider_model_name": "qwen3:8b",
+      "artifact_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "source": "provider_published",
+      "observed_at": "2026-09-02T00:00:00Z",
+      "effective_from": "2026-08-01T00:00:00Z",
+      "effective_until": "2026-12-01T00:00:00Z",
+      "price_tier": "batch",
+      "region": "eu-west-1",
+      "rates": {
+        "currency": "EUR",
+        "input_per_million_tokens": "0.15",
+        "output_per_million_tokens": "0.60",
+        "cache_read_per_million_tokens": "0"
+      }
+    }
+  ]
+}

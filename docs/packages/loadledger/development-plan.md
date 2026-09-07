@@ -172,3 +172,66 @@ intends to enforce purely to read a number through, which puts a fabricated cap 
 this is a **view**, not a cap.
 **Gold standards:** integer-exact, no float, no recomputation from history.
 
+
+---
+
+## Phase 4 — `loadledger.pricing`, the ADR-0072 catalogue reader — publish 0.3.0
+
+**Goal:** one reader for the price file, so the `pricing_hash` two applications store means the
+same price in both.
+
+**Prerequisites:** Phase 3; PromptCadence Phase 5 (row F1) and IdeaPress row J1 as built — the two
+consumers whose near-identical copies fired ADR-0072's own extraction trigger (row K4).
+
+**Work**
+* `pricing.py`: `load_pricing_records(path)`, `price_for_model(records, *, canonical_id, at)`,
+  `records_claiming(records, *, at)`, and `PricingFileError` in the existing hierarchy. Moved from
+  `promptcadence.services.pricing` — the format's first implementation — with its docstrings and
+  its refusal messages intact, because the messages are what an operator fixes a hand-written
+  price list from.
+* No new dependency, and **not** exported from `loadledger/__init__.py`: this module opens files,
+  and the package root promises it does not (the rule `loadledger.sql` already follows).
+* Functions over a sequence, not a catalogue class. The two consumers hold two different
+  containers — PromptCadence a tier map, IdeaPress a flat list — so a class here would name a
+  tuple and force one of them to wrap.
+* Each application keeps a thin edge: where the path comes from (its own configuration), and
+  translating `PricingFileError` into its own `ConfigurationError` so a broken price list is
+  still reported as the configuration mistake it is.
+
+**Files/subsystems**
+```text
+src/loadledger/pricing.py
+src/loadledger/errors.py                # PricingFileError
+tests/unit/test_pricing.py
+tests/data/adr0072_catalogue.json       # the golden file, hashed
+```
+
+**Tests**
+* Every format rule and every refusal of ADR-0072, as the union of what the two applications
+  asserted while each carried its own copy — transcribed, not rewritten, so a rule that does not
+  survive the move fails visibly.
+* **The golden-hash case.** A fixture file loads to records whose `pricing_hash` values equal the
+  literals measured from both applications' own loaders on that same file *before* either adopted
+  this module. `pricing_hash` is the join between a stored usage and the price it was costed under
+  (ADR-0030 rule 1); a moved reader that produced an equal-looking record with a different hash
+  would silently re-price every debit already in two databases.
+* An omitted rate stays `UNSUPPORTED` and a stated `"0"` is a real zero — asserted on the golden
+  file, where one record has each.
+
+**Acceptance criteria**
+1. Both applications' existing pricing tests pass **unchanged** against the adopted package: that
+   is what makes this an extraction rather than a rewrite (the rule ADR-0011 set at P12).
+2. The golden-hash case passes, and the hashes equal the pre-adoption measurement.
+3. `mypy --strict`, `ruff`, `lint-imports` clean; coverage ≥ 95 %.
+4. `loadledger 0.3.0` prepared; the tag and the publish are the operator's.
+
+**Known risks:** an application's refusal message is part of its own test corpus, so a reworded
+message breaks a test that had nothing to do with pricing. Mitigated by moving the messages
+verbatim.
+**Likely failure modes:** a hash that moves because a field was defaulted differently — the
+golden case exists for exactly this, and the standing instruction is to stop and report which
+fixture moved rather than to update the literal.
+**Gold standards:** one reader for one format; no fabricated zero; the application keeps its own
+configuration vocabulary.
+**Deferred:** a catalogue type (spec §21); anything that would make this module *acquire* a price
+rather than read one.
