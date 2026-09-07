@@ -3,6 +3,8 @@
 **Sequence position:** PromptCadence arc, stream P ([roadmap §4](../../roadmap/promptcadence-roadmap.md)).
 Depends on `baseaicore>=0.4.1`; parallel with CutCtx and ToolYard.
 **Target:** `loadledger 0.1.0` at the end of Phase 2.
+**Shipped:** `0.1.0` at row C3 and `0.2.0` — the balance read that names no run, Phase 3 — at row
+F4. **`0.2.0` is published.**
 
 The plan is deliberately small: LoadLedger's value is that it adds **nothing** to ADR-0030's cost
 model except accumulation and ceilings, and a small package is the proof.

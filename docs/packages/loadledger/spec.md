@@ -1,7 +1,7 @@
 # LoadLedger — Specification
 
 **Type:** Python package · **Import/distribution name:** `loadledger` · **Layer:** 3 (capability package)
-**Status:** Specified, not implemented. Part of the PromptCadence arc
+**Status:** Implemented and published as `loadledger 0.2.0`. Part of the PromptCadence arc
 ([roadmap](../../roadmap/promptcadence-roadmap.md)); builds entirely on
 [ADR-0030](../../adr/0030-model-cost-and-pricing.md)'s types — no new cost primitives — and
 introduces no persistence of its own beyond the mountable-models pattern (roadmap §2, D-6).
