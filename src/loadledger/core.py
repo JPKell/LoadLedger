@@ -27,7 +27,7 @@ as exceeding, so a hard budget is never crossed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -117,10 +117,6 @@ def resolved_debit(debit: Debit, occurred_at: datetime) -> Debit:
     landed in. Resolution happens once, from the ledger's injected clock, at the moment of
     recording.
 
-    ``dataclasses.replace`` is avoided deliberately: it re-runs ``__post_init__``, which is what
-    we want, but it also reconstructs a slotted frozen dataclass field by field, and doing it
-    explicitly here keeps the resolved shape visible at the one place it is created.
-
     Args:
         debit: The debit as the caller built it.
         occurred_at: The instant to use when the debit does not carry one.
@@ -131,14 +127,7 @@ def resolved_debit(debit: Debit, occurred_at: datetime) -> Debit:
     """
     if debit.occurred_at is not None:
         return debit
-    return type(debit)(
-        run_id=debit.run_id,
-        source_ref=debit.source_ref,
-        usage=debit.usage,
-        cost=debit.cost,
-        tags=debit.tags,
-        occurred_at=occurred_at,
-    )
+    return replace(debit, occurred_at=occurred_at)
 
 
 def is_unpriced(cost: CostEstimate | None) -> bool:
@@ -218,13 +207,10 @@ def contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> DebitContri
         reports that currency even when it priced nothing, because a ceiling in another currency
         must refuse it either way.
     """
-    tokens = 0
-    unmetered = False
-    for count in usage.as_counts().values():
-        if is_supported(count):
-            tokens += count
-        else:
-            unmetered = True
+    counts = usage.as_counts().values()
+    reported = [count for count in counts if is_supported(count)]
+    tokens = sum(reported)
+    unmetered = len(reported) < len(counts)
     if cost is None:
         return DebitContribution(
             tokens=tokens,
@@ -235,23 +221,22 @@ def contribution_of(usage: TokenUsage, cost: CostEstimate | None) -> DebitContri
             untotalled=False,
             unmetered=unmetered,
         )
-    nanos = 0
-    priced = False
-    for component in (
-        cost.input_cost,
-        cost.output_cost,
-        cost.cache_write_cost,
-        cost.cache_read_cost,
-    ):
-        if is_supported(component):
-            nanos += component.nanos
-            priced = True
+    priced_nanos = [
+        component.nanos
+        for component in (
+            cost.input_cost,
+            cost.output_cost,
+            cost.cache_write_cost,
+            cost.cache_read_cost,
+        )
+        if is_supported(component)
+    ]
     totalled = is_supported(cost.total)
     return DebitContribution(
         tokens=tokens,
         currency=cost.currency,
-        nanos=nanos,
-        priced=priced,
+        nanos=sum(priced_nanos),
+        priced=bool(priced_nanos),
         unpriced=not totalled,
         untotalled=not totalled,
         unmetered=unmetered,
@@ -326,10 +311,7 @@ class BalanceBook:
         """
         contribution = contribution_of(debit.usage, debit.cost)
         for key in self.windows_touched(debit.run_id, occurred_at, debit.tags):
-            balance = self._balances.get(key)
-            if balance is None:
-                balance = _ScopeBalance()
-                self._balances[key] = balance
+            balance = self._balances.setdefault(key, _ScopeBalance())
             balance.tokens_spent += contribution.tokens
             if contribution.unpriced:
                 balance.unpriced_debit_count += 1
@@ -519,8 +501,7 @@ class BalanceBook:
         """Build one ceiling's verdict from its window's balance plus any prospective debit."""
         key = self.window_for(ceiling, run_id=run_id, at=at)
         balance = self._balances.get(key, _EMPTY_BALANCE)
-        applies = prospective is not None and key in touched
-        delta = prospective if applies and prospective is not None else _NOTHING
+        delta = prospective if prospective is not None and key in touched else _NOTHING
 
         tokens_spent = balance.tokens_spent + delta.tokens
         tokens_remaining = None if ceiling.tokens is None else ceiling.tokens - tokens_spent

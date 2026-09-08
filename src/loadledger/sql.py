@@ -506,8 +506,8 @@ class SqlLedger:
                     occurred_at=_as_utc(occurred_at),
                     unpriced=entry.unpriced,
                     pricing_hash=entry.pricing_hash,
-                    debit_json=_dumps(resolved.as_canonical()),
-                    verdicts_json=_dumps([verdict.as_canonical() for verdict in verdicts]),
+                    debit_json=canonical_json(resolved.as_canonical()),
+                    verdicts_json=canonical_json([verdict.as_canonical() for verdict in verdicts]),
                 )
             )
         return entry
@@ -910,11 +910,6 @@ def _matches_any(table: Table, keys: frozenset[ScopeKey]) -> sa.ColumnElement[bo
     )
 
 
-def _dumps(value: object) -> str:
-    """Serialize a canonical mapping to the exact bytes spec contract 4 golden-tests."""
-    return canonical_json(value)
-
-
 def _as_utc(when: datetime) -> datetime:
     """Return ``when`` as a timezone-aware UTC instant, for binding to a column.
 
@@ -947,12 +942,11 @@ def _count_from_canonical(value: object) -> TokenCount:
     return UNSUPPORTED
 
 
-def _money_from_canonical(value: object) -> Money | None:
+def _money_from_canonical(value: Mapping[str, Any] | None) -> Money | None:
     """Rebuild a :class:`~baseaicore.Money` from its canonical mapping, or ``None``."""
     if value is None:
         return None
-    mapping = dict(value)  # type: ignore[call-overload] # a canonical Money is always a mapping
-    return Money(currency=str(mapping["currency"]), nanos=int(mapping["nanos"]))
+    return Money(currency=str(value["currency"]), nanos=int(value["nanos"]))
 
 
 @lru_cache(maxsize=256)

@@ -7,6 +7,11 @@ packaging and release standards §3.
 
 ## [Unreleased]
 
+### Changed
+- Internal tightening with no behavioural change: `resolved_debit` uses `dataclasses.replace`,
+  `contribution_of` sums comprehensions, `BalanceBook.record` uses `setdefault`, and the SQL
+  ledger serializes through `canonical_json` directly.
+
 ### Added
 
 - `tests/unit/test_readme_version.py` — asserts the version README.md states after its `Status:`
