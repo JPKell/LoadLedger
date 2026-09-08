@@ -3,7 +3,7 @@
 Budget accumulation and ceilings over ADR-0030's cost types: debits, per-scope balances, and
 explicable ceiling verdicts. No pricing, no conversion, no policy.
 
-**Status:** **0.3.0 prepared; `0.2.0` on PyPI.** Ceilings, debits, verdicts, `InMemoryLedger`, the
+**Status:** `0.3.0`, on PyPI. Ceilings, debits, verdicts, `InMemoryLedger`, the
 mountable tables and `SqlLedger` on SQLite and PostgreSQL, scope-window `balances`/`position`
 reads, and an ADR-0072 pricing-catalogue reader.
 

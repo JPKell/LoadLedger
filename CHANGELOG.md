@@ -7,6 +7,17 @@ packaging and release standards §3.
 
 ## [Unreleased]
 
+### Added
+
+- `tests/unit/test_readme_version.py` — asserts the version README.md states after its `Status:`
+  line equals `__about__.__version__`, so a release cannot leave the README stale (M9 re-audit,
+  row L7).
+
+### Fixed
+
+- README's `Status:` line still read "`0.3.0` prepared; `0.2.0` on PyPI" after `0.3.0` published;
+  it now states `0.3.0`, on PyPI.
+
 ## [0.3.0] — 2026-09-07
 
 ### Added
