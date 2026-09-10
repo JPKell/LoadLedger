@@ -66,7 +66,7 @@ packaging and release standards §3.
   number through (a fabricated cap in the record).
 - `Ledger.position()` on all three: `remaining` for **no particular run** — every configured
   ceiling, `PER_DAY` resolved at the injected clock's UTC day. This is the half that actually
-  retires the reference-run workaround `docs/history/F1_HANDOFF.md` §7 recorded, because `balances` alone fixes
+  retires the reference-run workaround `docs/history/handoffs/F1_HANDOFF.md` §7 recorded, because `balances` alone fixes
   a scope with no ceiling while a scope *with* one needs headroom, and deriving headroom outside
   the package would put the floor rule and the `exceeded` decision in a consumer. An empty ledger
   reports the configured caps with nothing spent — true as a fact, where the previous answer was
